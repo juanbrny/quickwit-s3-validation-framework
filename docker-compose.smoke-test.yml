@@ -1,0 +1,28 @@
+# Spins up a local MinIO so you can smoke-test this framework itself before
+# pointing it at a real vendor endpoint. MinIO is one of the two providers
+# Quickwit was originally designed against, so a clean pass here is the
+# floor, not the ceiling, for what "certified" should mean.
+#
+# Usage:
+#   docker compose -f docker-compose.smoke-test.yml up -d
+#   python run_certification.py compat --endpoint http://localhost:9000 \
+#     --bucket qw-cert --access-key minioadmin --secret-key minioadmin --region minio
+#   python run_certification.py load --endpoint http://localhost:9000 \
+#     --bucket qw-cert --access-key minioadmin --secret-key minioadmin \
+#     --flavor minio --tier 100GB --duration-min 5
+version: "3.8"
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+
+volumes:
+  minio-data:

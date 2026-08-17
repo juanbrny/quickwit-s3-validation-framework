@@ -1,0 +1,4 @@
+boto3>=1.34
+botocore>=1.34
+awscrt>=0.20   # required for botocore's client-side CRC32C checksum support (checksum_algorithm="crc32c" default)
+PyYAML>=6.0

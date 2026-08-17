@@ -1,0 +1,82 @@
+# Throughput tiers and the model constants behind docs/03_throughput_tier_sizing.md
+# All GB below are GiB-equivalent (1024-based) to match Quickwit's own docs.
+
+model_constants:
+  peak_multiplier: 3.0          # peak-to-average burst ratio [assumption]
+  compression_ratio: 2.75       # raw bytes / indexed bytes [docs: 23TB benchmark]
+  commit_timeout_s: 60          # indexer flush interval [docs default]
+  merge_factor: 10              # splits consolidated per merge [docs default]
+  mature_split_gb: 5            # mid of documented 1-10GB mature split range
+  per_core_indexing_mbps: 27    # worst-case, adversarial dataset [docs]
+  multipart_part_gb: 5          # "1 PUT request / 5GB" [docs]
+  s3_max_concurrency_per_node: 50   # [assumption] tune via QW_S3_MAX_CONCURRENCY equivalent
+
+tiers:
+  # Sized around real BYOC (bring your own cloud) usage: commercial deployments
+  # mostly range from 1TB/day to 1PB/day of raw log ingest. 100GB/day sits
+  # below that range and exists only for completeness, not because it is a
+  # commercially relevant BYOC size.
+  100GB:
+    raw_gb_per_day: 100
+    query_qps: 1
+  1TB:
+    raw_gb_per_day: 1024
+    query_qps: 10
+  10TB:
+    raw_gb_per_day: 10240
+    query_qps: 40
+  100TB:
+    raw_gb_per_day: 102400
+    query_qps: 150
+  1PB:
+    raw_gb_per_day: 1048576
+    query_qps: 500
+
+# Tiers beyond the commercial range covered by `tiers` above. Real, but rare,
+# customers ingest around 10PB/day. This tier is NOT in `run_certification.py
+# load`'s default --tier choices and must never run silently: at this volume
+# a soak test moves petabytes of data, which can run up a large, real cloud
+# bill fast, and any left-behind objects/buckets become a hidden ongoing
+# cost. Only run it with an operator who has explicitly signed off on the
+# cost and who owns guaranteed teardown of everything the run creates.
+extreme_tiers:
+  10PB:
+    raw_gb_per_day: 10485760
+    query_qps: 1200
+
+query_profiles:
+  # Modeled after docs/01 section 5's documented GET-count formula.
+  # GET requests ~= num_splits_hit * ((fields*terms*3) + fieldnorm_fields + 1) + docs_returned
+  - name: single_term_lookup
+    weight: 0.5
+    num_search_fields: 1
+    num_terms: 1
+    fieldnorm_fields: 1
+    docs_returned: 20
+  - name: multi_term_phrase
+    weight: 0.3
+    num_search_fields: 3
+    num_terms: 2
+    fieldnorm_fields: 2
+    docs_returned: 50
+  - name: timestamp_range_aggregation
+    weight: 0.2
+    num_search_fields: 0
+    num_terms: 0
+    fieldnorm_fields: 0
+    docs_returned: 0   # aggregation only touches the timestamp fast field (+1 handled in code)
+
+pass_fail_bands:
+  error_rate_max_pct: 0.1
+  throttle_rate_sustained_max_pct: 1.0
+  put_p99_multiplier_vs_aws: 2.0
+  range_get_p99_multiplier_vs_aws: 2.0
+  bulk_delete_p99_multiplier_vs_aws: 3.0
+  query_wall_clock_p99_multiplier_vs_aws: 2.5
+  sustained_throughput_min_pct_of_target: 95.0
+  consistency_probe_min_success_pct: 100.0
+  consistency_probe_deadline_s: 30   # must match default polling_interval
+  fanout_efficiency_min: 0.4   # see concurrency_fanout.py -- below this, "concurrent"
+                               # requests are effectively being serialized somewhere
+                               # in the path and the backend fails the fan-out sweep
+  fanout_concurrency_levels: [1, 8, 16, 32, 64, 128, 256]

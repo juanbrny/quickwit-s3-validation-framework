@@ -1,12 +1,20 @@
-# Quickwit S3 Storage Provider Validation Framework
+# Datadog BYOC/Quickwit S3 Storage Provider Validation Framework
 
 This is a self-certification framework for storage vendors. Examples include SeaweedFS,
-NetApp StorageGRID, Ceph/RGW, MinIO, Garage, and custom appliances.
+NetApp StorageGRID, Ceph/RGW, MinIO, Scality, and custom appliances.
 It lets a vendor prove that their Amazon Simple Storage Service (S3)-compatible
 endpoint behaves like AWS S3, for the specific way Quickwit uses S3.
-The framework tests this across six log-ingestion throughput tiers:
+The framework tests this across five log-ingestion throughput tiers, sized
+around real bring-your-own-cloud (BYOC) usage, which mostly ranges from
+1 TB/day to 1 PB/day:
 
-`100 GB/day · 200 GB/day · 500 GB/day · 1 TB/day · 2 TB/day · 5 TB/day`
+`100 GB/day · 1 TB/day · 10 TB/day · 100 TB/day · 1 PB/day`
+
+100 GB/day sits below that commercial range and exists mainly for
+completeness. A 10 PB/day tier also exists for customers at that
+scale, but it is opt-in only (`--confirm-extreme-cost`) because a soak at
+that volume can run up a large, real cloud bill — see
+`docs/03_throughput_tier_sizing.md`.
 
 It is not a generic S3 benchmark. It is a **workload-shaped** benchmark.
 The traffic it generates mirrors what an indexer/merger/searcher/janitor fleet
@@ -36,7 +44,7 @@ docs/
   02_test_methodology.md          <- the 3-layer test plan, pass/fail bars
   03_throughput_tier_sizing.md    <- how GB/day maps to S3 ops/sec, worked examples
 config/
-  tiers.yaml                      <- the 6 throughput tiers + tunable assumptions
+  tiers.yaml                      <- the 5 throughput tiers + extreme_tiers + tunable assumptions
 src/
   qw_s3_client.py                 <- boto3 wrapper mirroring Quickwit's `flavor` knobs
   workload_model.py               <- GB/day -> op-mix math (footnoted to docs/03)
@@ -87,9 +95,9 @@ python run_certification.py load \
 python run_certification.py report --tier 1TB --out report_1TB.md
 ```
 
-Repeat steps 4 and 5 for each of the six tiers you want to certify.
-A vendor does not need to pass the 5 TB/day tier to get certified for
-200 GB/day use cases. The report is per-tier, not all-or-nothing.
+Repeat steps 4 and 5 for each of the tiers you want to certify.
+A vendor does not need to pass the 1 PB/day tier to get certified for
+100 GB/day use cases. The report is per-tier, not all-or-nothing.
 
 ## Testing the framework itself
 

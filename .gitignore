@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Certification output — keep the folder, not generated reports
+reports/*
+!reports/.gitkeep
+
+.env
+*.env

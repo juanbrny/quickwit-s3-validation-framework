@@ -80,3 +80,8 @@ pass_fail_bands:
                                # requests are effectively being serialized somewhere
                                # in the path and the backend fails the fan-out sweep
   fanout_concurrency_levels: [1, 8, 16, 32, 64, 128, 256, 512, 1024]
+  put_fanout_efficiency_min: 0.4   # see put_fanout.py -- same interpretation as
+                                    # fanout_efficiency_min, applied to concurrent
+                                    # independent PUTs (indexer commits) instead of
+                                    # concurrent range-GETs (queries)
+  put_fanout_concurrency_levels: [1, 8, 16, 32, 64, 128]

@@ -2,10 +2,11 @@
 """
 CLI entrypoint. See README.md for the full quick-start.
 
-    run_certification.py compat  --endpoint ... --bucket ... --access-key ... --secret-key ...
-    run_certification.py fanout  --endpoint ... --bucket ... --access-key ... --secret-key ...
-    run_certification.py load    --endpoint ... --bucket ... --tier 1TB --duration-min 30
-    run_certification.py report  --tier 1TB --out report_1TB.md
+    run_certification.py compat      --endpoint ... --bucket ... --access-key ... --secret-key ...
+    run_certification.py fanout      --endpoint ... --bucket ... --access-key ... --secret-key ...
+    run_certification.py put-fanout  --endpoint ... --bucket ... --access-key ... --secret-key ...
+    run_certification.py load        --endpoint ... --bucket ... --tier 1TB --duration-min 30
+    run_certification.py report      --tier 1TB --out report_1TB.md
 """
 from __future__ import annotations
 
@@ -25,7 +26,10 @@ from src.query_sim import run_query_sim
 from src.consistency_probes import run_consistency_probes
 from src.concurrency_fanout import (
     prepare_fanout_object, run_fanout_sweep,
-    summarize_fanout, render_fanout_markdown,
+    summarize_fanout, render_fanout_markdown, DEFAULT_LEVEL_REPEATS,
+)
+from src.put_fanout import (
+    run_put_fanout_sweep, summarize_put_fanout, render_put_fanout_markdown,
 )
 from src.report import (
     summarize_ops, compare_to_baseline, render_markdown_report,
@@ -74,9 +78,10 @@ def cmd_fanout(args):
     key = f"qwcert/fanout/{tag}-test-object.split"
 
     print(f"Uploading a {args.object_size_mb}MB test object and sweeping "
-          f"concurrency levels {levels}...")
+          f"concurrency levels {levels} ({args.repeats} repeats/level)...")
     obj_size = prepare_fanout_object(client, args.bucket, key, size_mb=args.object_size_mb)
-    results = run_fanout_sweep(base_cfg, args.bucket, key, obj_size, concurrency_levels=levels)
+    results = run_fanout_sweep(base_cfg, args.bucket, key, obj_size, concurrency_levels=levels,
+                                repeats=args.repeats)
     summary = summarize_fanout(results, efficiency_floor=bands["fanout_efficiency_min"])
 
     json_out = REPORTS_DIR / f"fanout_{tag}.json"
@@ -89,6 +94,45 @@ def cmd_fanout(args):
     if summary["degrades_at_concurrency"]:
         print(f"Degrades at concurrency = {summary['degrades_at_concurrency']} "
               f"(efficiency floor {bands['fanout_efficiency_min']})")
+    else:
+        print("No degradation found within the tested concurrency range.")
+
+
+def cmd_put_fanout(args):
+    """
+    The write-side counterpart to `fanout`: can this backend sustain many
+    concurrent, independent PutObject calls -- the pattern many indexer
+    nodes committing splits with overlapping timing produces -- without
+    serializing them or degrading per-request latency? See put_fanout.py.
+    """
+    cfg_yaml = load_config()
+    bands = cfg_yaml["pass_fail_bands"]
+    levels = [int(x) for x in args.levels.split(",")] if args.levels else bands["put_fanout_concurrency_levels"]
+
+    base_cfg = QwS3Config.from_flavor(args.flavor, args.endpoint, args.access_key,
+                                       args.secret_key, args.region)
+    client = QwS3Client(base_cfg)
+    client.ensure_bucket(args.bucket)
+
+    tag = _safe_name(args.endpoint)
+    prefix = f"qwcert/put-fanout/{tag}"
+
+    print(f"Sweeping concurrent PUT levels {levels} ({args.repeats} repeats/level, "
+          f"{args.object_size_kb}KB per object)...")
+    results = run_put_fanout_sweep(base_cfg, args.bucket, prefix, concurrency_levels=levels,
+                                    object_size_kb=args.object_size_kb, repeats=args.repeats)
+    summary = summarize_put_fanout(results, efficiency_floor=bands["put_fanout_efficiency_min"])
+
+    json_out = REPORTS_DIR / f"put_fanout_{tag}.json"
+    json_out.write_text(json.dumps(summary, indent=2))
+    md_out = REPORTS_DIR / f"put_fanout_{tag}.md"
+    render_put_fanout_markdown(summary, md_out)
+
+    print(f"Full results (JSON): {json_out}")
+    print(f"Sweep table (Markdown): {md_out}")
+    if summary["degrades_at_concurrency"]:
+        print(f"Degrades at concurrency = {summary['degrades_at_concurrency']} "
+              f"(efficiency floor {bands['put_fanout_efficiency_min']})")
     else:
         print("No degradation found within the tested concurrency range.")
 
@@ -241,7 +285,28 @@ def main():
     p_fanout.add_argument("--levels", default=None,
                            help="Comma-separated concurrency levels, e.g. 1,8,16,32,64,128,256 "
                                 "(defaults to config/tiers.yaml pass_fail_bands.fanout_concurrency_levels)")
+    p_fanout.add_argument("--repeats", type=int, default=DEFAULT_LEVEL_REPEATS,
+                           help="Trials per concurrency level; the median trial is kept, so an "
+                                "isolated slow or fast run near the pass/fail line can't decide "
+                                f"the verdict by itself (default {DEFAULT_LEVEL_REPEATS})")
     p_fanout.set_defaults(func=cmd_fanout)
+
+    p_put_fanout = sub.add_parser("put-fanout")
+    p_put_fanout.add_argument("--endpoint", required=True)
+    p_put_fanout.add_argument("--bucket", required=True)
+    p_put_fanout.add_argument("--access-key", required=True)
+    p_put_fanout.add_argument("--secret-key", required=True)
+    p_put_fanout.add_argument("--region", default="us-east-1")
+    p_put_fanout.add_argument("--flavor", default="none")
+    p_put_fanout.add_argument("--object-size-kb", type=float, default=512.0)
+    p_put_fanout.add_argument("--levels", default=None,
+                               help="Comma-separated concurrency levels, e.g. 1,8,16,32,64,128 "
+                                    "(defaults to config/tiers.yaml pass_fail_bands.put_fanout_concurrency_levels)")
+    p_put_fanout.add_argument("--repeats", type=int, default=DEFAULT_LEVEL_REPEATS,
+                               help="Trials per concurrency level; the median trial is kept, so an "
+                                    "isolated slow or fast run near the pass/fail line can't decide "
+                                    f"the verdict by itself (default {DEFAULT_LEVEL_REPEATS})")
+    p_put_fanout.set_defaults(func=cmd_put_fanout)
 
     p_load = sub.add_parser("load")
     p_load.add_argument("--endpoint", required=True)

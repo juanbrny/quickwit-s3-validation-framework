@@ -32,6 +32,16 @@ so there is no GIL contention between in-flight requests; re-running the
 same comparison confirmed both AWS S3 and the vendor endpoint under test
 stayed above the efficiency floor through the full sweep once the harness
 stopped being the bottleneck.
+
+NOISE AND REPEATS: a single sample per concurrency level is not reliable
+close to the pass/fail line. Real AWS S3, tested repeatedly from the same
+EC2 instance, produced efficiency values hovering around 0.4-0.5 in the
+32-64 concurrency range and flipped between "degrades at 32" and "degrades
+at 64" across back-to-back runs with no code change -- ordinary network
+jitter, not a real difference in AWS's behavior. Each level therefore runs
+`repeats` times (default 3, see DEFAULT_LEVEL_REPEATS), and the run whose
+wall-clock time is the median of the repeats is kept, so an isolated slow
+or fast trial cannot flip the verdict on its own.
 """
 from __future__ import annotations
 
@@ -53,6 +63,7 @@ from .qw_s3_client import QwS3Client, QwS3Config
 DEFAULT_CONCURRENCY_LEVELS = [1, 8, 16, 32, 64, 128, 256, 512, 1024]
 RANGE_SIZE_BYTES = 8 * 1024  # matches query_sim's term/field lookup size
 DEFAULT_SPLIT_SIZE_MB = 8.0  # small mature split, per docs/03
+DEFAULT_LEVEL_REPEATS = 3  # see module docstring, "NOISE AND REPEATS"
 
 
 @dataclass
@@ -158,28 +169,64 @@ async def _run_one_level(s3_client, bucket: str, key: str, obj_size: int, k: int
     )
 
 
+async def _run_level_with_repeats(s3_client, bucket: str, key: str, obj_size: int,
+                                   k: int, repeats: int) -> FanoutLevelResult:
+    """Runs one concurrency level `repeats` times and keeps the trial whose
+    wall-clock time is the median, so an isolated slow or fast trial (see
+    "NOISE AND REPEATS" in the module docstring) cannot decide the verdict
+    on its own."""
+    trials = [await _run_one_level(s3_client, bucket, key, obj_size, k) for _ in range(repeats)]
+    trials.sort(key=lambda r: r.wall_clock_s)
+    return trials[len(trials) // 2]
+
+
+async def _warm_up_connections(s3_client, bucket: str, key: str, obj_size: int, count: int):
+    """
+    Opens `count` connections against the endpoint before any level is
+    timed, so the timed sweep measures the backend's ability to sustain
+    concurrent requests, not the one-time cost of establishing that many
+    new TLS connections at once. Without this, the top concurrency levels
+    fold connection setup (DNS, TCP handshake, TLS handshake) into the
+    same measurement as request handling, and that setup cost scales with
+    concurrency for any backend, well-behaved or not -- it isn't something
+    the sweep is meant to detect.
+    """
+    max_offset = max(0, obj_size - RANGE_SIZE_BYTES - 1)
+    offsets = [random.randint(0, max_offset) for _ in range(count)]
+    await asyncio.gather(*[
+        _get_range_async(s3_client, bucket, key, off, off + RANGE_SIZE_BYTES - 1)
+        for off in offsets
+    ])
+
+
 async def _run_fanout_sweep_async(cfg: QwS3Config, bucket: str, key: str, obj_size: int,
-                                   concurrency_levels: list) -> list:
+                                   concurrency_levels: list, repeats: int) -> list:
     session = aioboto3.Session()
-    kwargs = _async_client_kwargs(cfg, max(concurrency_levels))
+    top = max(concurrency_levels)
+    kwargs = _async_client_kwargs(cfg, top)
     results = []
     async with session.client("s3", **kwargs) as s3_client:
+        await _warm_up_connections(s3_client, bucket, key, obj_size, top)
         for k in concurrency_levels:
-            results.append(await _run_one_level(s3_client, bucket, key, obj_size, k))
+            results.append(await _run_level_with_repeats(s3_client, bucket, key, obj_size, k, repeats))
     return results
 
 
 def run_fanout_sweep(cfg: QwS3Config, bucket: str, key: str, obj_size: int,
-                      concurrency_levels: Optional[list] = None) -> list:
+                      concurrency_levels: Optional[list] = None,
+                      repeats: int = DEFAULT_LEVEL_REPEATS) -> list:
     """
-    For each concurrency level K, fires K concurrent range-GETs at random
-    offsets within the object (mirroring the term/field lookup shape used
-    in query_sim.py), and records wall-clock time for the whole batch plus
-    each individual request's latency. See the module docstring for why
-    this runs on asyncio rather than a thread pool.
+    First warms up the connection pool by firing an untimed batch at the
+    top concurrency level (see _warm_up_connections), then for each
+    concurrency level K fires K concurrent range-GETs at random offsets
+    within the object (mirroring the term/field lookup shape used in
+    query_sim.py) `repeats` times, keeping the median trial (see "NOISE AND
+    REPEATS" in the module docstring), and records wall-clock time for the
+    whole batch plus each individual request's latency. See the module
+    docstring for why this runs on asyncio rather than a thread pool.
     """
     concurrency_levels = concurrency_levels or DEFAULT_CONCURRENCY_LEVELS
-    return asyncio.run(_run_fanout_sweep_async(cfg, bucket, key, obj_size, concurrency_levels))
+    return asyncio.run(_run_fanout_sweep_async(cfg, bucket, key, obj_size, concurrency_levels, repeats))
 
 
 def summarize_fanout(results: list, efficiency_floor: float = 0.4) -> dict:

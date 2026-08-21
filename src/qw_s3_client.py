@@ -14,6 +14,7 @@ import dataclasses
 import hashlib
 import io
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import boto3
@@ -144,25 +145,30 @@ class QwS3Client:
                     "error": e.response.get("Error", {}).get("Code", str(e))}
 
     def _checksum_kwargs(self, data: bytes) -> dict:
-        if self.cfg.checksum_algorithm == "md5":
-            return {"ContentMD5": _b64_md5(data)}
-        if self.cfg.checksum_algorithm == "disabled":
-            return {}
-        # crc32c: let the SDK attach its native trailer checksum (default boto3 behavior
-        # when ChecksumAlgorithm is specified)
-        return {"ChecksumAlgorithm": "CRC32C"}
+        return checksum_kwargs_for(self.cfg, data)
 
     def _multipart_put(self, bucket: str, key: str, data: bytes, part_size=5 * 1024 * 1024 * 1024):
         mp = self._client.create_multipart_upload(Bucket=bucket, Key=key)
         upload_id = mp["UploadId"]
-        parts = []
+        offsets = list(enumerate(range(0, len(data), part_size), start=1))
+
+        def _upload_one(item):
+            part_number, offset = item
+            chunk = data[offset: offset + part_size]
+            p = self._client.upload_part(
+                Bucket=bucket, Key=key, PartNumber=part_number, UploadId=upload_id, Body=chunk,
+            )
+            return {"ETag": p["ETag"], "PartNumber": part_number}
+
         try:
-            for i, offset in enumerate(range(0, len(data), part_size), start=1):
-                chunk = data[offset: offset + part_size]
-                p = self._client.upload_part(
-                    Bucket=bucket, Key=key, PartNumber=i, UploadId=upload_id, Body=chunk,
-                )
-                parts.append({"ETag": p["ETag"], "PartNumber": i})
+            # Real S3 clients -- including the AWS SDK for Rust that Quickwit
+            # uses -- upload multipart parts concurrently, not one at a time.
+            # A backend that quietly serializes concurrent UploadPart calls
+            # would look fine against a sequential uploader but bottleneck
+            # real ingest throughput for mature splits. Bounded to 10
+            # in-flight parts, matching s3transfer's own default.
+            with ThreadPoolExecutor(max_workers=min(len(offsets), 10)) as pool:
+                parts = sorted(pool.map(_upload_one, offsets), key=lambda p: p["PartNumber"])
             return self._client.complete_multipart_upload(
                 Bucket=bucket, Key=key, UploadId=upload_id,
                 MultipartUpload={"Parts": parts},
@@ -242,6 +248,19 @@ class QwS3Client:
 
     def metastore_write(self, bucket: str, key: str, data: bytes) -> dict:
         return self.put_split(bucket, key, data)
+
+
+def checksum_kwargs_for(cfg: QwS3Config, data: bytes) -> dict:
+    """Shared by QwS3Client (sync) and put_fanout.py's async client, so both
+    exercise the same upload-integrity behavior Quickwit's checksum_algorithm
+    setting controls."""
+    if cfg.checksum_algorithm == "md5":
+        return {"ContentMD5": _b64_md5(data)}
+    if cfg.checksum_algorithm == "disabled":
+        return {}
+    # crc32c: let the SDK attach its native trailer checksum (default boto3 behavior
+    # when ChecksumAlgorithm is specified)
+    return {"ChecksumAlgorithm": "CRC32C"}
 
 
 def _b64_md5(data: bytes) -> str:

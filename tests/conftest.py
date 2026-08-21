@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import boto3
 import pytest
 from moto import mock_aws
+from moto.server import ThreadedMotoServer
 
 TEST_BUCKET = "qw-cert-test"
 TEST_REGION = "us-east-1"
@@ -46,3 +47,20 @@ def moto_s3(aws_credentials):
         client = boto3.client("s3", region_name=TEST_REGION)
         client.create_bucket(Bucket=TEST_BUCKET)
         yield client
+
+
+@pytest.fixture(scope="function")
+def moto_server_endpoint():
+    """
+    Starts moto as a real local HTTP server, rather than mock_aws()'s
+    monkeypatch of botocore internals. concurrency_fanout.py's sweep runs
+    on aiobotocore, which talks to S3 over real HTTP via aiohttp --
+    mock_aws() doesn't implement the response interface aiobotocore
+    expects, so it silently fails against it. A real server on localhost
+    is a genuine HTTP endpoint either client can hit.
+    """
+    server = ThreadedMotoServer(port=0)
+    server.start()
+    port = server._server.socket.getsockname()[1]
+    yield f"http://127.0.0.1:{port}"
+    server.stop()

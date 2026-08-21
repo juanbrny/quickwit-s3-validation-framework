@@ -1,4 +1,7 @@
 # Only needed to run the framework's own test suite (tests/) -- not needed
 # to run run_certification.py against a real vendor endpoint.
 pytest>=7.4
-moto[s3]>=5.0
+# server extra pulls in Flask/Werkzeug, needed for ThreadedMotoServer --
+# tests/test_concurrency_fanout.py runs the asyncio fanout sweep against a
+# real local moto HTTP server, since mock_aws() doesn't support aiobotocore.
+moto[s3,server]>=5.0

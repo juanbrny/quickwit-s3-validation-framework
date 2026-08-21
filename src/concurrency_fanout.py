@@ -19,29 +19,38 @@ serializing "concurrent" requests, which breaks the entire premise this
 architecture depends on regardless of what its raw single-request latency
 looks like).
 
-IMPORTANT correctness note: the boto3 client's own connection pool is fixed
-at construction time to cfg.max_concurrency (see qw_s3_client.py). If this
-sweep used a client sized for typical query traffic (default 50), sweeping
-past that would measure *our own tool's* connection-pool ceiling, not the
-vendor's. build_fanout_client() below sizes the pool to comfortably exceed
-the top of the sweep so any degradation observed is the backend's, not
-ours.
+CONCURRENCY MODEL: the sweep is asyncio-based (aioboto3/aiobotocore), not
+thread-based. An earlier thread-per-request version (ThreadPoolExecutor)
+produced false "degrades at concurrency = 32" verdicts on low-latency links
+-- confirmed by running it against real AWS S3 from a low-latency EC2
+instance and seeing the *same* collapse there. On a low-latency link, the
+per-request Python work each thread does under the GIL (SigV4 signing,
+response parsing) is no longer hidden behind network wait time, so threads
+queue for the GIL instead of running concurrently, and the tool measures its
+own ceiling instead of the backend's. asyncio runs everything on one thread,
+so there is no GIL contention between in-flight requests; re-running the
+same comparison confirmed both AWS S3 and the vendor endpoint under test
+stayed above the efficiency floor through the full sweep once the harness
+stopped being the bottleneck.
 """
 from __future__ import annotations
 
-import dataclasses
+import asyncio
 import os
 import random
 import statistics
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import aioboto3
+from botocore.client import Config as BotoConfig
+from botocore.exceptions import ClientError
+
 from .qw_s3_client import QwS3Client, QwS3Config
 
-DEFAULT_CONCURRENCY_LEVELS = [1, 8, 16, 32, 64, 128, 256]
+DEFAULT_CONCURRENCY_LEVELS = [1, 8, 16, 32, 64, 128, 256, 512, 1024]
 RANGE_SIZE_BYTES = 8 * 1024  # matches query_sim's term/field lookup size
 DEFAULT_SPLIT_SIZE_MB = 8.0  # small mature split, per docs/03
 
@@ -81,17 +90,6 @@ class FanoutLevelResult:
         return self.p50_per_request_s / self.wall_clock_s
 
 
-def build_fanout_client(base_cfg: QwS3Config, concurrency_levels: list) -> QwS3Client:
-    """
-    Clones base_cfg but forces max_concurrency high enough to comfortably
-    exceed the top of the sweep, so the connection pool on our side is
-    never what limits observed concurrency. See module docstring.
-    """
-    top = max(concurrency_levels) if concurrency_levels else 1
-    fanout_cfg = dataclasses.replace(base_cfg, max_concurrency=max(top * 2, 20))
-    return QwS3Client(fanout_cfg)
-
-
 def prepare_fanout_object(client: QwS3Client, bucket: str, key: str,
                            size_mb: float = DEFAULT_SPLIT_SIZE_MB) -> int:
     """Uploads a synthetic split-sized object to fan concurrent reads out against."""
@@ -104,41 +102,84 @@ def prepare_fanout_object(client: QwS3Client, bucket: str, key: str,
     return size
 
 
-def run_fanout_sweep(client: QwS3Client, bucket: str, key: str, obj_size: int,
+def _async_client_kwargs(cfg: QwS3Config, top_concurrency: int) -> dict:
+    """
+    Sizes the connection pool comfortably past the top of the sweep, so
+    aiohttp's own connector limit is never what caps observed concurrency
+    -- the async equivalent of the old build_fanout_client()'s job.
+    """
+    boto_cfg = BotoConfig(
+        signature_version="s3v4",
+        s3={"addressing_style": "path" if cfg.force_path_style else "auto"},
+        max_pool_connections=max(top_concurrency * 2, 20),
+        retries={"max_attempts": 3, "mode": "standard"},
+    )
+    return dict(
+        endpoint_url=cfg.endpoint_url,
+        aws_access_key_id=cfg.access_key,
+        aws_secret_access_key=cfg.secret_key,
+        region_name=cfg.region,
+        config=boto_cfg,
+    )
+
+
+async def _get_range_async(s3_client, bucket: str, key: str, start: int, end: int) -> dict:
+    t0 = time.perf_counter()
+    range_hdr = f"bytes={start}-{end}"
+    try:
+        resp = await s3_client.get_object(Bucket=bucket, Key=key, Range=range_hdr)
+        body = await resp["Body"].read()
+        return {"ok": True, "op": "get_object_range", "latency_s": time.perf_counter() - t0,
+                "bytes": len(body)}
+    except ClientError as e:
+        return {"ok": False, "op": "get_object_range", "latency_s": time.perf_counter() - t0,
+                "error": e.response.get("Error", {}).get("Code", str(e))}
+
+
+async def _run_one_level(s3_client, bucket: str, key: str, obj_size: int, k: int) -> FanoutLevelResult:
+    max_offset = max(0, obj_size - RANGE_SIZE_BYTES - 1)
+    offsets = [random.randint(0, max_offset) for _ in range(k)]
+
+    t0 = time.perf_counter()
+    responses = await asyncio.gather(*[
+        _get_range_async(s3_client, bucket, key, off, off + RANGE_SIZE_BYTES - 1)
+        for off in offsets
+    ])
+    wall_clock = time.perf_counter() - t0
+
+    latencies = [r["latency_s"] for r in responses]
+    errors = [r for r in responses if not r["ok"]]
+    throttles = [r for r in errors if (r.get("error") or "").lower()
+                 in ("slowdown", "requestlimitexceeded", "503", "throttlingexception")]
+
+    return FanoutLevelResult(
+        concurrency=k, wall_clock_s=wall_clock, per_request_latencies_s=latencies,
+        error_count=len(errors), throttle_count=len(throttles),
+    )
+
+
+async def _run_fanout_sweep_async(cfg: QwS3Config, bucket: str, key: str, obj_size: int,
+                                   concurrency_levels: list) -> list:
+    session = aioboto3.Session()
+    kwargs = _async_client_kwargs(cfg, max(concurrency_levels))
+    results = []
+    async with session.client("s3", **kwargs) as s3_client:
+        for k in concurrency_levels:
+            results.append(await _run_one_level(s3_client, bucket, key, obj_size, k))
+    return results
+
+
+def run_fanout_sweep(cfg: QwS3Config, bucket: str, key: str, obj_size: int,
                       concurrency_levels: Optional[list] = None) -> list:
     """
     For each concurrency level K, fires K concurrent range-GETs at random
     offsets within the object (mirroring the term/field lookup shape used
-    in query_sim.py), using a thread pool sized to K, and records wall-clock
-    time for the whole batch plus each individual request's latency.
+    in query_sim.py), and records wall-clock time for the whole batch plus
+    each individual request's latency. See the module docstring for why
+    this runs on asyncio rather than a thread pool.
     """
     concurrency_levels = concurrency_levels or DEFAULT_CONCURRENCY_LEVELS
-    results = []
-
-    for k in concurrency_levels:
-        max_offset = max(0, obj_size - RANGE_SIZE_BYTES - 1)
-        offsets = [random.randint(0, max_offset) for _ in range(k)]
-
-        def _one(offset):
-            return client.get_range(bucket, key, offset, offset + RANGE_SIZE_BYTES - 1)
-
-        t0 = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=k) as pool:
-            futures = [pool.submit(_one, off) for off in offsets]
-            responses = [f.result() for f in futures]
-        wall_clock = time.perf_counter() - t0
-
-        latencies = [r["latency_s"] for r in responses]
-        errors = [r for r in responses if not r["ok"]]
-        throttles = [r for r in errors if (r.get("error") or "").lower()
-                     in ("slowdown", "requestlimitexceeded", "503", "throttlingexception")]
-
-        results.append(FanoutLevelResult(
-            concurrency=k, wall_clock_s=wall_clock, per_request_latencies_s=latencies,
-            error_count=len(errors), throttle_count=len(throttles),
-        ))
-
-    return results
+    return asyncio.run(_run_fanout_sweep_async(cfg, bucket, key, obj_size, concurrency_levels))
 
 
 def summarize_fanout(results: list, efficiency_floor: float = 0.4) -> dict:

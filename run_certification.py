@@ -24,7 +24,7 @@ from src.ingest_merge_sim import run_ingest_merge_sim, SplitKeyRegistry
 from src.query_sim import run_query_sim
 from src.consistency_probes import run_consistency_probes
 from src.concurrency_fanout import (
-    build_fanout_client, prepare_fanout_object, run_fanout_sweep,
+    prepare_fanout_object, run_fanout_sweep,
     summarize_fanout, render_fanout_markdown,
 )
 from src.report import (
@@ -67,9 +67,7 @@ def cmd_fanout(args):
 
     base_cfg = QwS3Config.from_flavor(args.flavor, args.endpoint, args.access_key,
                                        args.secret_key, args.region)
-    # Sized so our own connection pool is never the bottleneck -- see
-    # build_fanout_client()'s docstring for why this matters.
-    client = build_fanout_client(base_cfg, levels)
+    client = QwS3Client(base_cfg)
     client.ensure_bucket(args.bucket)
 
     tag = _safe_name(args.endpoint)
@@ -78,7 +76,7 @@ def cmd_fanout(args):
     print(f"Uploading a {args.object_size_mb}MB test object and sweeping "
           f"concurrency levels {levels}...")
     obj_size = prepare_fanout_object(client, args.bucket, key, size_mb=args.object_size_mb)
-    results = run_fanout_sweep(client, args.bucket, key, obj_size, concurrency_levels=levels)
+    results = run_fanout_sweep(base_cfg, args.bucket, key, obj_size, concurrency_levels=levels)
     summary = summarize_fanout(results, efficiency_floor=bands["fanout_efficiency_min"])
 
     json_out = REPORTS_DIR / f"fanout_{tag}.json"

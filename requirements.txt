@@ -1,4 +1,12 @@
-boto3>=1.34
-botocore>=1.34
-awscrt>=0.20   # required for botocore's client-side CRC32C checksum support (checksum_algorithm="crc32c" default)
+# boto3/botocore/awscrt are pinned to exact versions, not ranges. aioboto3
+# pins aiobotocore to an exact version, and aiobotocore pins botocore to a
+# narrow range (see its own metadata). With loose bounds here, pip tries the
+# newest boto3/botocore first, hits that narrow range, and backtracks one
+# version at a time -- this is what makes "pip install -r requirements.txt"
+# take a very long time on a fresh machine. Exact pins let pip resolve
+# without searching.
+boto3==1.40.61
+botocore==1.40.61
+awscrt==0.27.6   # must match botocore's declared crt extra for this botocore version, or checksum signing crashes intermittently under thread concurrency
 PyYAML>=6.0
+aioboto3==15.5.0  # async engine for concurrency_fanout_async.py (run_certification.py fanout --engine asyncio)

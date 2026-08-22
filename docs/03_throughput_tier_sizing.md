@@ -1,12 +1,20 @@
 # Throughput Tier → S3 Op-Mix Math
 
-Each constant below comes from one of two sources.
+Each constant below comes from one of three sources.
 
 - Quickwit's published documentation, marked **[docs]**.
 - Explicit, tunable modeling assumptions, marked **[assumption]**.
+- Confirmed directly against Pomsky's (Datadog's Quickwit fork) source, marked **[pomsky]**.
 
 `config/tiers.yaml` exposes all assumptions. Change them if your dataset or
 configuration differs from Quickwit's own adversarial benchmark.
+
+This is v1 of the suite: the **[pomsky]**-marked rows were checked against
+real source during v1 hardening; the remaining **[docs]**/**[assumption]**
+rows (`per_core_mbps`, `mature_split_gb`) are known to need a closer look
+-- see the note below the table -- but are left as-is until real usage of
+both this suite and the separate integration-test suite produces feedback
+to correct them against.
 
 ## Inputs
 
@@ -15,11 +23,13 @@ configuration differs from Quickwit's own adversarial benchmark.
 | `T` | Raw log ingest, GB/day | 100 / 1,024 / 10,240 / 102,400 / 1,048,576 | user-selected tier |
 | `peak_mult` | Peak-to-average burst ratio | 3.0 | **[assumption]** typical diurnal log traffic |
 | `compression` | Raw bytes ÷ indexed (S3) bytes | 2.75 | **[docs]** 23 TB benchmark |
-| `commit_timeout_s` | Indexer flush interval | 60s | **[docs]** default |
-| `merge_factor` | Splits consolidated per merge | 10 | **[docs]** default |
-| `mature_split_gb` | Target mature split size | 5 GB (mid of 1-10GB range) | **[docs]** |
-| `per_core_mbps` | Worst-case per-core indexing throughput | 27 MB/s | **[docs]** adversarial benchmark |
-| `multipart_part_gb` | Part size once multipart kicks in | 5 GB | **[docs]** "1 PUT / 5GB" |
+| `commit_timeout_s` | Indexer flush interval | 60s | **[pomsky]** `default_commit_timeout_secs()`, confirmed exact match |
+| `merge_factor` | Splits consolidated per merge | 10 | **[pomsky]** `default_merge_factor()`, confirmed exact match |
+| `mature_split_gb` | Target mature split size | 5 GB (mid of 1-10GB range) | **[docs]** -- **known issue**: Pomsky's actual split maturity is time-based (48h `maturation_period`), not size-based at all. This constant models PUT payload size for the ingest/merge pattern, not real "maturity"; needs reframing, not fixed in v1. |
+| `per_core_mbps` | Worst-case per-core indexing throughput | 27 MB/s | **[docs]** adversarial benchmark -- **known issue**: Pomsky's real constant, `PIPELINE_THROUGHPUT`, is 20 MB/s **per pipeline** (~4 CPU threads), not per core, with real-world typically >30 MB/s. The per-core unit and the pipelines-per-node multiplier need correcting; not fixed in v1. |
+| `s3_max_concurrency_per_node` | Concurrent in-flight S3 requests per node | 10,000 | **[pomsky]** `QW_S3_MAX_CONCURRENCY` env var default, confirmed (`s3_compatible_storage.rs`); previously modeled as 50, off by 200x |
+| `multipart_threshold` | Object size that triggers multipart upload | 128 MiB | **[pomsky]** `MultiPartPolicy::default().multipart_threshold_num_bytes`, confirmed; previously modeled as ~5 GB (conflated with target part size), off by ~40x |
+| `multipart_part_gb` | Target part size once multipart is in use | 5 GB | **[pomsky]** `MultiPartPolicy::default().target_part_num_bytes`, confirmed exact match |
 
 ## Step 1 — Raw → sustained/peak MB/s
 

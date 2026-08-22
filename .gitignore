@@ -1,3 +1,4 @@
+enginesrc/
 venv/
 __pycache__/
 *.pyc

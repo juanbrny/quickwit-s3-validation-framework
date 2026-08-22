@@ -43,6 +43,12 @@ FLAVOR_PRESETS = {
 # Candidates tried, in order, by compat_checks.py auto-probe mode.
 AUTO_PROBE_ORDER = ["none", "minio", "garage", "digital_ocean", "gcs"]
 
+# Pomsky's real MultiPartPolicy default (quickwit-storage/src/object_storage/policy.rs):
+# multipart_threshold_num_bytes = 128 MiB, target_part_num_bytes = 5 GiB. An earlier
+# version of this constant assumed a ~5GB threshold (conflating it with the target part
+# size); confirmed against Pomsky source that the actual trigger is 128 MiB, 40x smaller.
+MULTIPART_THRESHOLD_BYTES = 128 * 1024 * 1024
+
 
 @dataclasses.dataclass
 class QwS3Config:
@@ -123,16 +129,16 @@ class QwS3Client:
     # ---- uploads: single PUT vs multipart, mirroring Quickwit's rule ------
     def put_split(self, bucket: str, key: str, data: bytes) -> dict:
         """
-        Mirrors Quickwit's documented behavior: single PutObject for small
-        (immature) splits; multipart once the object exceeds
-        multipart_part_gb-equivalent size, unless multipart is disabled
-        (GCS flavor), in which case fall back to a single PutObject
-        regardless of size (matching `disable_multipart_upload: true`).
+        Mirrors Pomsky's real MultiPartPolicy: single PutObject below
+        MULTIPART_THRESHOLD_BYTES (128 MiB), multipart at or above it,
+        unless multipart is disabled (GCS flavor), in which case fall back
+        to a single PutObject regardless of size (matching
+        `disable_multipart_upload: true`).
         """
         t0 = time.perf_counter()
         extra = self._checksum_kwargs(data)
         try:
-            if self.cfg.disable_multipart_upload or len(data) <= 5 * 1024 * 1024 * 1024:
+            if self.cfg.disable_multipart_upload or len(data) < MULTIPART_THRESHOLD_BYTES:
                 resp = self._client.put_object(Bucket=bucket, Key=key, Body=data, **extra)
                 op = "put_object"
             else:

@@ -132,12 +132,15 @@ def _do_merge(node_id: int, client: QwS3Client, bucket: str, prefix: str,
                               bytes=res.get("bytes", 0), error=res.get("error")))
         total_bytes += res.get("bytes", 0)
 
-    # PUT the merged output (multipart kicks in automatically inside put_split
-    # once size crosses the 5GB boundary; we scale a synthetic payload up to
-    # the modeled mature_split size for realism without literally moving GBs
-    # of urandom data through a test harness on every merge).
+    # PUT the merged output. put_split() switches to multipart automatically
+    # once size crosses MULTIPART_THRESHOLD_BYTES (128 MiB, confirmed against
+    # Pomsky's real MultiPartPolicy default). The cap here (160 MB) sits just
+    # above that threshold on purpose -- an earlier 64 MB cap sat entirely
+    # below it, so `load` runs never actually exercised the multipart path,
+    # only the single-PutObject one, regardless of how large a real merged
+    # split would be for the tier under test.
     merged_key = f"{prefix}/node{node_id}/merged-{int(time.time()*1000)}.split"
-    merged_payload = _synthetic_payload(min(total_bytes / (1024 * 1024), 64))  # capped for test cost
+    merged_payload = _synthetic_payload(min(total_bytes / (1024 * 1024), 160))  # capped for test cost, above the multipart threshold
     res = client.put_split(bucket, merged_key, merged_payload)
     sink.write(ResultRow(ts=time.time(), worker=f"merger-{node_id}", op=res["op"],
                           ok=res["ok"], latency_s=res["latency_s"],

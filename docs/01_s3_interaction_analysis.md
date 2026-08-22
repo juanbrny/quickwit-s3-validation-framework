@@ -60,9 +60,15 @@ benchmark blog post:
 - A merge policy progressively merges splits, with a default `merge_factor`
   of **10**. A split becomes "mature" at roughly **10 million documents**,
   typically **1–10 GB** on disk.
-- A mature split usually needs 2 PUT requests to upload (1 PUT request per
-  5 GB). Quickwit uses multipart upload once a split passes S3's ~5 GB limit
-  for a single PUT request.
+- **Confirmed against Pomsky source** (`quickwit-storage/src/object_storage/policy.rs`,
+  `MultiPartPolicy::default()`): multipart upload triggers once an object
+  reaches **128 MiB** (`multipart_threshold_num_bytes`), not the ~5 GB this
+  section previously assumed from public docs alone. The **target part
+  size** is 5 GiB (`target_part_num_bytes`) once multipart is in use, so a
+  large mature split can still need only 1-2 parts -- but the *decision* to
+  go multipart at all happens 40x earlier than previously modeled. A split
+  in the 26-196 MB per-commit range this suite already computes
+  (`workload_model.py`) sits right around this real threshold.
 - In the adversarial 23 TB benchmark, sustained indexing throughput reached
   **~27 MB/s per core** in the worst case. Typical structured logs index
   faster than this. Quickwit's team chose the `c5n.2xlarge` instance type
@@ -74,11 +80,10 @@ benchmark blog post:
   ratio determines how many actual bytes reach S3 per GB of raw log data
   ingested.
 
-**Assumption flagged:** Quickwit does not publish the exact per-pipeline
-concurrency or multipart part size it uses internally. The test harness
-models the following behavior instead: it uploads a mature split via
-multipart upload in ~5 GB parts, and uploads an immature split via a single
-PUT request. This model matches the documented PUT-count rule above.
+The test harness models this directly: `qw_s3_client.py`'s `put_split()`
+uses a single PutObject below `MULTIPART_THRESHOLD_BYTES` (128 MiB) and
+switches to multipart at or above it, with 5 GiB target part sizes,
+matching Pomsky's real `MultiPartPolicy` default.
 
 ## 4. Compact/Merge → read/write amplification
 
@@ -203,7 +208,7 @@ This has two direct consequences for the test suite:
 | Test category | Quickwit dependency | Real-world failure mode if absent |
 |---|---|---|
 | Path-style addressing | Bucket resolution | Indexer can't reach the bucket at all |
-| Multipart upload (5 MB–5 GB parts, ≤5 TB object) | Splits > ~5 GB | Ingest fails once splits mature past 5 GB. Works in demos, breaks in production |
+| Multipart upload (5 GiB target parts, ≤5 TB object) | Objects ≥ 128 MiB | Ingest fails once commits/merged splits cross 128 MiB, which is well within this suite's own modeled per-commit size range. Works in demos, breaks in production |
 | Multi-Object Delete (≤1000 keys), with per-object fallback | Janitor/GC | GC fails outright, or silently falls back to slow per-key deletes; backlog grows |
 | Checksum handling (crc32c trailer / MD5 / none) | Every upload | Uploads rejected, or silently mishandled by the SDK; most common real-world break |
 | Byte-range GET (start-end, open-ended, suffix, out-of-range) | Every query | Query correctness or latency regressions, most visible under concurrency |

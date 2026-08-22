@@ -9,7 +9,9 @@ model_constants:
   mature_split_gb: 5            # mid of documented 1-10GB mature split range
   per_core_indexing_mbps: 27    # worst-case, adversarial dataset [docs]
   multipart_part_gb: 5          # "1 PUT request / 5GB" [docs]
-  s3_max_concurrency_per_node: 50   # [assumption] tune via QW_S3_MAX_CONCURRENCY equivalent
+  s3_max_concurrency_per_node: 10000   # [pomsky] QW_S3_MAX_CONCURRENCY default
+                                        # (s3_compatible_storage.rs), confirmed against
+                                        # source; previously modeled as 50, off by 200x
 
 tiers:
   # Sized around real BYOC (bring your own cloud) usage: commercial deployments

@@ -29,6 +29,21 @@ def test_put_and_get_full_roundtrip(moto_s3):
     assert got["bytes"] == len(payload)
 
 
+def test_put_split_routes_to_multipart_above_the_threshold(moto_s3):
+    """put_split()'s own size check, not _multipart_put() called directly --
+    confirms the 128 MiB threshold (MULTIPART_THRESHOLD_BYTES) actually
+    decides the route, matching Pomsky's real MultiPartPolicy default."""
+    c = _client()
+    payload = b"z" * (130 * 1024 * 1024)  # above the 128 MiB multipart threshold
+    res = c.put_split(TEST_BUCKET, "test/above-threshold.split", payload)
+    assert res["ok"], res.get("error")
+    assert res["op"] == "multipart_upload"
+
+    got = c.get_full(TEST_BUCKET, "test/above-threshold.split")
+    assert got["ok"]
+    assert got["bytes"] == len(payload)
+
+
 def test_multipart_upload_completes(moto_s3):
     c = _client()
     payload = b"x" * (12 * 1024 * 1024)  # 12MB
@@ -42,9 +57,11 @@ def test_multipart_upload_completes(moto_s3):
 
 
 def test_disable_multipart_upload_falls_back_to_single_put(moto_s3):
-    """Mirrors the `gcs` flavor: disable_multipart_upload: true."""
+    """Mirrors the `gcs` flavor: disable_multipart_upload: true. Payload is
+    above MULTIPART_THRESHOLD_BYTES (128 MiB) so this actually exercises the
+    flag -- a smaller payload would take the single-PUT path regardless."""
     c = _client(disable_multipart_upload=True)
-    payload = b"y" * (6 * 1024 * 1024)  # would trigger multipart if enabled
+    payload = b"y" * (130 * 1024 * 1024)  # above the 128 MiB multipart threshold
     res = c.put_split(TEST_BUCKET, "test/no-multipart.split", payload)
     assert res["ok"], res.get("error")
     assert res["op"] == "put_object"

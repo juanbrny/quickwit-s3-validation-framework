@@ -21,17 +21,62 @@ import boto3
 from botocore.client import Config as BotoConfig
 from botocore.exceptions import ClientError
 
-# Known Quickwit "flavor" presets, transcribed from storage-config.md
+# Storage flavors. Each one is a named combination of the `storage.s3.*`
+# knobs Quickwit exposes.
+#
+# Two groups exist, and the difference matters for what a user can ship:
+#
+# * Upstream flavors (UPSTREAM_FLAVORS) are transcribed from Quickwit's
+#   storage-config.md. A user can select them by name with
+#   `storage.s3.flavor: <name>`.
+# * Local flavors (everything else) are candidate configurations this
+#   framework adds for vendors Quickwit has no flavor for. Quickwit does not
+#   know these names. A user must ship the explicit knobs instead, which is
+#   what `as_quickwit_yaml()` always renders.
 FLAVOR_PRESETS = {
     "none": dict(force_path_style=False, disable_multi_object_delete=False,
                  disable_multipart_upload=False, checksum_algorithm="crc32c",
                  region_override=None),
+    # Same knobs as "none". It exists so a run against AWS S3 itself can say
+    # so, instead of reading as "no flavor selected".
+    "aws": dict(force_path_style=False, disable_multi_object_delete=False,
+                disable_multipart_upload=False, checksum_algorithm="crc32c",
+                region_override=None),
     "minio": dict(force_path_style=True, disable_multi_object_delete=False,
                   disable_multipart_upload=False, checksum_algorithm="crc32c",
                   region_override="minio"),
     "garage": dict(force_path_style=True, disable_multi_object_delete=False,
                    disable_multipart_upload=False, checksum_algorithm="crc32c",
                    region_override="garage"),
+    # SeaweedFS and Scality (RING S3 Connector, CloudServer) flavors, with
+    # the evidence for each knob:
+    #
+    # * Bulk delete stays on. SeaweedFS registers DeleteMultipleObjects
+    #   (weed/s3api/s3api_server.go) and Scality lists Multi-Object Delete
+    #   as supported.
+    # * Multipart stays on. Both implement CreateMultipartUpload, UploadPart
+    #   and CompleteMultipartUpload.
+    # * Path style is on. Both support virtual-hosted style, but only with
+    #   extra setup: SeaweedFS routes bucket subdomains only when started
+    #   with a virtual host domain, and Scality needs wildcard DNS (Domain
+    #   Name System) plus a matching certificate, and cannot serve hosted
+    #   style at all when the endpoint is an IP address. Path style works in
+    #   every deployment.
+    # * MD5 (Message Digest 5), not CRC32C. Both break on the AWS SDK's
+    #   default trailing checksum: SeaweedFS writes the trailer into the
+    #   stored object (seaweedfs issue 6548), and Scality CloudServer
+    #   rejects it with "400 BadRequest: trailing checksum is not supported"
+    #   (cloudserver issue 5553). See boto_config() for the botocore option
+    #   that makes this setting authoritative.
+    #
+    # The two flavors hold the same knobs today. They stay separate so a
+    # report names the vendor that was actually tested.
+    "seaweedfs": dict(force_path_style=True, disable_multi_object_delete=False,
+                      disable_multipart_upload=False, checksum_algorithm="md5",
+                      region_override=None),
+    "scality": dict(force_path_style=True, disable_multi_object_delete=False,
+                    disable_multipart_upload=False, checksum_algorithm="md5",
+                    region_override=None),
     "digital_ocean": dict(force_path_style=True, disable_multi_object_delete=True,
                            disable_multipart_upload=False, checksum_algorithm="crc32c",
                            region_override=None),
@@ -40,8 +85,49 @@ FLAVOR_PRESETS = {
                 region_override=None),
 }
 
-# Candidates tried, in order, by compat_checks.py auto-probe mode.
-AUTO_PROBE_ORDER = ["none", "minio", "garage", "digital_ocean", "gcs"]
+# Flavors Quickwit itself accepts as `storage.s3.flavor: <name>`.
+UPSTREAM_FLAVORS = frozenset({"none", "minio", "garage", "digital_ocean", "gcs"})
+
+# Flavors that keep every AWS S3 default. A run on one of these needs no
+# deviation, so it can reach a plain CERTIFIED verdict.
+DEFAULT_FLAVORS = frozenset({"none", "aws"})
+
+# Candidates tried, in order, by compat_checks.py auto-probe mode. Least
+# deviation first, so the probe recommends the mildest configuration that
+# works. "aws" is absent on purpose: it repeats "none" exactly.
+AUTO_PROBE_ORDER = ["none", "minio", "garage", "seaweedfs", "scality",
+                    "digital_ocean", "gcs"]
+
+
+def flavor_signature(flavor: str) -> tuple:
+    """Knob values of a flavor, for finding flavors that are identical."""
+    preset = FLAVOR_PRESETS[flavor]
+    return tuple(sorted(preset.items(), key=lambda item: item[0]))
+
+
+def same_settings(a: Optional[str], b: Optional[str]) -> bool:
+    """True when two flavor names select the same knob values.
+
+    `none` and `aws` hold identical knobs, so a run with one of them agrees
+    with a recommendation of the other.
+    """
+    if a is None or b is None:
+        return False
+    if a not in FLAVOR_PRESETS or b not in FLAVOR_PRESETS:
+        return a == b
+    return flavor_signature(a) == flavor_signature(b)
+
+
+def flavor_note(flavor: Optional[str]) -> Optional[str]:
+    """Warn when Quickwit does not accept this flavor name in its config."""
+    if flavor is None or flavor in UPSTREAM_FLAVORS or flavor in DEFAULT_FLAVORS:
+        return None
+    return (
+        f"Quickwit has no built-in flavor named `{flavor}`. "
+        "Ship the storage.s3 settings below verbatim instead of `flavor: "
+        f"{flavor}`."
+    )
+
 
 # Pomsky's real MultiPartPolicy default (quickwit-storage/src/object_storage/policy.rs):
 # multipart_threshold_num_bytes = 128 MiB, target_part_num_bytes = 5 GiB. An earlier
@@ -101,12 +187,7 @@ class QwS3Client:
 
     def __init__(self, cfg: QwS3Config):
         self.cfg = cfg
-        boto_cfg = BotoConfig(
-            signature_version="s3v4",
-            s3={"addressing_style": "path" if cfg.force_path_style else "auto"},
-            max_pool_connections=max(cfg.max_concurrency, 10),
-            retries={"max_attempts": 3, "mode": "standard"},
-        )
+        boto_cfg = boto_config(cfg, max(cfg.max_concurrency, 10))
         self._client = boto3.client(
             "s3",
             endpoint_url=cfg.endpoint_url,
@@ -254,6 +335,28 @@ class QwS3Client:
 
     def metastore_write(self, bucket: str, key: str, data: bytes) -> dict:
         return self.put_split(bucket, key, data)
+
+
+def boto_config(cfg: "QwS3Config", max_pool_connections: int) -> BotoConfig:
+    """Shared botocore settings for every client this framework builds.
+
+    `request_checksum_calculation="when_required"` matters. botocore 1.36 and
+    later add their own CRC32 (Cyclic Redundancy Check, 32-bit) trailer to
+    every upload, even when the caller asks for no checksum or for
+    Content-MD5 (Message Digest 5). That default would send a trailing
+    checksum under the `md5` and `disabled` settings, which is the exact
+    request SeaweedFS corrupts and Scality rejects with 400 BadRequest. With
+    this option, boto3 sends only the checksum `checksum_algorithm` selects,
+    so the setting stays authoritative. An explicit `crc32c` request is still
+    sent, because asking for it makes it required.
+    """
+    return BotoConfig(
+        signature_version="s3v4",
+        s3={"addressing_style": "path" if cfg.force_path_style else "auto"},
+        max_pool_connections=max_pool_connections,
+        retries={"max_attempts": 3, "mode": "standard"},
+        request_checksum_calculation="when_required",
+    )
 
 
 def checksum_kwargs_for(cfg: QwS3Config, data: bytes) -> dict:

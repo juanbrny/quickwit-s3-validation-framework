@@ -43,11 +43,20 @@ class ResultRow:
 class ResultSink:
     def __init__(self, out_path: Path):
         self._lock = threading.Lock()
-        self._f = open(out_path, "a", buffering=1)
+        self._f = open(out_path, "x", buffering=1)
+        self.errors = []
 
     def write(self, row: ResultRow):
         with self._lock:
             self._f.write(json.dumps(asdict(row)) + "\n")
+
+    def run(self, target, args, stop_event):
+        try:
+            target(*args)
+        except Exception as error:
+            with self._lock:
+                self.errors.append(type(error).__name__)
+            stop_event.set()
 
     def close(self):
         self._f.close()
@@ -83,12 +92,13 @@ def _synthetic_payload(size_mb: float) -> bytes:
     size = max(1024, int(size_mb * 1024 * 1024))
     # Deterministic-ish but not all-zero (some backends fast-path all-zero
     # objects in ways that don't reflect real split content).
-    return os.urandom(min(size, 4 * 1024 * 1024)) * max(1, size // (4 * 1024 * 1024))
+    chunk = os.urandom(min(size, 4 * 1024 * 1024))
+    return (chunk * ((size + len(chunk) - 1) // len(chunk)))[:size]
 
 
 def indexer_worker(node_id: int, client: QwS3Client, bucket: str, prefix: str,
                     op_mix: OpMix, duration_s: float, stop_event: threading.Event,
-                    sink: ResultSink, merge_factor: int, registry: "SplitKeyRegistry"):
+                    sink: ResultSink, merge_factor: int, registry: "SplitKeyRegistry", commit_timeout_s: float = 60):
     produced_keys: list[str] = []
     end_time = time.time() + duration_s
     split_seq = 0
@@ -116,8 +126,8 @@ def indexer_worker(node_id: int, client: QwS3Client, bucket: str, prefix: str,
 
         # 3. Sleep out the remainder of the commit interval (commit_timeout_s, default 60s)
         elapsed = time.time() - loop_start
-        sleep_for = max(0.0, 60 - elapsed)
-        stop_event.wait(sleep_for)
+        sleep_for = max(0.0, commit_timeout_s - elapsed)
+        stop_event.wait(min(sleep_for, max(0, end_time - time.time())))
 
 
 def _do_merge(node_id: int, client: QwS3Client, bucket: str, prefix: str,
@@ -160,7 +170,7 @@ def _do_merge(node_id: int, client: QwS3Client, bucket: str, prefix: str,
 def run_ingest_merge_sim(client: QwS3Client, bucket: str, prefix: str, op_mix: OpMix,
                           duration_min: float, out_path: Path, registry: "SplitKeyRegistry",
                           merge_factor: int = 10, stop_event: threading.Event = None,
-                          block: bool = True):
+                          block: bool = True, commit_timeout_s: float = 60):
     """
     If `block=False`, returns the list of started threads immediately so the
     caller can run this concurrently with run_query_sim() and
@@ -174,10 +184,10 @@ def run_ingest_merge_sim(client: QwS3Client, bucket: str, prefix: str, op_mix: O
     threads = []
     duration_s = duration_min * 60
     for node_id in range(op_mix.num_indexer_nodes):
-        t = threading.Thread(target=indexer_worker, args=(
+        t = threading.Thread(target=sink.run, args=(indexer_worker, (
             node_id, client, bucket, prefix, op_mix, duration_s, stop_event, sink,
-            merge_factor, registry
-        ), daemon=True)
+            merge_factor, registry, commit_timeout_s
+        ), stop_event), daemon=True)
         threads.append(t)
         t.start()
 

@@ -149,7 +149,7 @@ def query_worker_loop(client: QwS3Client, bucket: str, split_keys_provider,
                                   error=None if all_ok else "one_or_more_gets_failed"))
 
             elapsed = time.time() - loop_start
-            stop_event.wait(max(0.0, interval - elapsed))
+            stop_event.wait(min(max(0.0, interval - elapsed), max(0, end_time-time.time())))
 
 
 def run_query_sim(client: QwS3Client, bucket: str, split_keys_provider,
@@ -168,10 +168,10 @@ def run_query_sim(client: QwS3Client, bucket: str, split_keys_provider,
     threads = []
 
     for _ in range(num_workers):
-        t = threading.Thread(target=query_worker_loop, args=(
+        t = threading.Thread(target=sink.run, args=(query_worker_loop, (
             client, bucket, split_keys_provider, profiles, qps / num_workers,
             duration_s, stop_event, sink
-        ), daemon=True)
+        ), stop_event), daemon=True)
         threads.append(t)
         t.start()
 

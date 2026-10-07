@@ -1,10 +1,21 @@
 # Test Methodology
 
+**Implementation and reporting status:** see
+[Measurement policy](measurement_policy.md), and
+[Run a validation](run_a_validation.md) for the commands.
+The HTML report evaluates available evidence and explicitly marks missing gates.
+The current simulator does not measure an independent merge backlog and therefore
+cannot issue full tier certification. The requirements below describe the intended
+certification bar, not a claim that every measurement is already implemented.
+
 This methodology uses three gated layers. A vendor must clear layer N before
 layer N+1 is worth running. For example, a 1 PB/day soak test against an
 endpoint that fails basic multipart semantics has no value.
 
-## Layer 1 — API compliance (generic, run once per endpoint)
+## Layer 1 — API compliance (external tools, run once per endpoint)
+
+No command in this repo. Run `s3-tests` or `mint`, then attach the evidence
+with `report --compliance`.
 
 This layer is not Quickwit-specific. It uses existing, mature open-source
 test suites instead of building new ones:
@@ -24,7 +35,7 @@ Failures outside that subset don't block certification. For example, bucket
 ACL or versioning edge cases that Quickwit never touches. The framework
 still logs these failures.
 
-## Layer 2 — Quickwit compatibility knobs (fast, functional, this repo)
+## Layer 2 — Quickwit compatibility knobs (`compat`, seconds)
 
 `src/compat_checks.py` runs a scripted sequence for each knob in the table
 above. It reports which Quickwit storage-config combination, if any, makes
@@ -33,16 +44,19 @@ the endpoint work:
 1. Try the default configuration: path-style off, multi-delete on,
    multipart on, `checksum_algorithm: crc32c`.
 2. If any sub-check fails, retry with the single most likely override. This
-   mirrors Quickwit's own `flavor` presets. Record which flag fixed the
-   failure.
+   mirrors Quickwit's own `flavor` values, plus the flavors this framework
+   adds for SeaweedFS and Scality. Record which flag fixed the failure.
+   Presets that hold the same settings are checked once, and the result is
+   reused for the twin.
 3. Output a minimal `storage.s3.*` YAML block for a user of that vendor to
    ship. This artifact is the most useful one for Quickwit's maintainers,
-   because it is a candidate `flavor` preset.
+   because it is a candidate `flavor` value.
 
 Gate: **at least one working configuration exists.** A vendor that only
 works with three overrides set does not FAIL. It gets a "PASS WITH
 DEVIATION" result. Upstream already handles `gcs` and `digital_ocean` the
-same way.
+same way. The `none` and `aws` flavors set no override, so they are the only
+ones that can reach a plain PASS.
 
 **Automated self-tests for this layer:** `tests/test_compat_checks.py` runs
 the same five checks against `moto`, an in-memory Simple Storage Service
@@ -50,11 +64,11 @@ the same five checks against `moto`, an in-memory Simple Storage Service
 independent of any real vendor.
 
 Running `run_certification.py compat` against a real endpoint also writes
-`reports/compat_<endpoint>.md`. This file is a flavor × check comparison
+`compat.md` in the run directory. This file is a flavor × check comparison
 table, in the same format as the customer-facing deck. The command also
 writes the raw JSON output.
 
-## Layer 2.5 — Concurrency fan-out sweep (fast, this repo)
+## Layer 2.5 — Concurrency fan-out sweep (`read-concurrency`, `write-concurrency`, seconds)
 
 Layers 1 and 2 confirm that the API is implemented correctly. Neither one
 answers the real question: **can the backend sustain enough concurrent
@@ -131,7 +145,7 @@ not check efficiency thresholds or `degrades_at_concurrency`. Moto has no
 real network latency to hide behind concurrency, so those numbers are only
 meaningful against a real endpoint.
 
-## Layer 3 — Workload-shaped load test (this repo, per throughput tier)
+## Layer 3 — Workload-shaped load test (`load`, one throughput tier, a long soak)
 
 For a chosen tier, from 100 GB to 1 PB per day, `run_certification.py load`
 does the following. A 10 PB/day `extreme_tiers` entry also exists for the

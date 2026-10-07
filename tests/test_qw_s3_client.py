@@ -4,6 +4,8 @@ docs/01_s3_interaction_analysis.md section 2 says it should -- single PUT vs
 multipart, bulk delete vs per-object fallback, path-style addressing, and
 range-GET semantics -- against moto's in-memory S3 emulator.
 """
+import pytest
+
 from src.qw_s3_client import QwS3Client, QwS3Config
 
 TEST_BUCKET = "qw-cert-test"  # must match tests/conftest.py's moto_s3 fixture
@@ -133,3 +135,50 @@ def test_checksum_algorithms_all_succeed(moto_s3):
         c = _client(checksum_algorithm=algo)
         res = c.put_split(TEST_BUCKET, f"test/checksum-{algo}.txt", b"payload")
         assert res["ok"], f"{algo}: {res.get('error')}"
+
+
+def _sent_checksum_headers(cfg, payload=b"checksum-payload"):
+    """Capture the checksum headers a real PutObject would carry."""
+    client = QwS3Client(cfg)
+    captured = {}
+
+    def record(request, **kwargs):
+        captured.update(
+            {
+                name.lower(): value
+                for name, value in request.headers.items()
+                if "checksum" in name.lower() or name.lower() in ("x-amz-trailer", "content-md5")
+            }
+        )
+
+    client._client.meta.events.register("before-send.s3.PutObject", record)
+    client.ensure_bucket(TEST_BUCKET)
+    assert client.put_split(TEST_BUCKET, "compat/checksum-headers", payload)["ok"]
+    return captured
+
+
+@pytest.mark.parametrize(
+    "algorithm,expected_trailer",
+    [("crc32c", b"x-amz-checksum-crc32c"), ("md5", None), ("disabled", None)],
+)
+def test_checksum_setting_decides_what_goes_on_the_wire(
+    moto_s3, algorithm, expected_trailer
+):
+    """
+    botocore 1.36 and later attach their own CRC32 trailer to every upload
+    unless `request_checksum_calculation` says otherwise. Without that
+    option, the `md5` and `disabled` settings still sent
+    `x-amz-trailer: x-amz-checksum-crc32`, so they did not avoid the
+    trailing checksum they exist to avoid. SeaweedFS writes that trailer
+    into the stored object (seaweedfs issue 6548) and Scality CloudServer
+    rejects it with 400 BadRequest (cloudserver issue 5553), so the
+    seaweedfs and scality flavors would have failed for the original reason
+    while reporting a different configuration.
+    """
+    cfg = QwS3Config(
+        endpoint_url=None, access_key="testing", secret_key="testing",
+        region="us-east-1", checksum_algorithm=algorithm,
+    )
+    headers = _sent_checksum_headers(cfg)
+    assert headers.get("x-amz-trailer") == expected_trailer
+    assert ("content-md5" in headers) is (algorithm == "md5")

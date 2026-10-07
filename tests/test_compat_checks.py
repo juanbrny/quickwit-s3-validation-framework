@@ -14,7 +14,7 @@ calling the raw client directly, which would have made probe_flavor never
 succeed for a vendor whose whole reason for needing that flavor override is
 that the raw operation doesn't work).
 """
-from src import compat_checks
+from src import compat_checks, qw_s3_client
 from src.qw_s3_client import QwS3Client, QwS3Config
 
 TEST_BUCKET = "qw-cert-test"  # must match tests/conftest.py's moto_s3 fixture
@@ -87,7 +87,7 @@ def test_probe_flavor_recommends_none_for_a_fully_compliant_endpoint(moto_s3, mo
     """
     Restrict the probe order to just `none` so the test isn't sensitive to
     moto's handling of the artificial region strings the `minio`/`garage`
-    flavor presets use (region overridden to the literal string "minio" or
+    flavors use (region overridden to the literal string "minio" or
     "garage") -- that's a real-vendor concern, not something worth coupling
     this unit test to. The control flow being tested here is: try flavor,
     run all checks, short-circuit on full pass, return the recommended
@@ -102,3 +102,51 @@ def test_probe_flavor_recommends_none_for_a_fully_compliant_endpoint(moto_s3, mo
     assert result["attempts"]["none"]["all_passed"] is True
     # `none` has no overrides, so its yaml block is just the bare storage.s3 stanza
     assert result["attempts"]["none"]["yaml"].strip() == "storage:\n  s3:"
+
+
+def test_every_flavor_builds_a_client_and_passes_against_moto(moto_s3):
+    """
+    Each flavor must produce a config that still works end to end. This
+    covers the flavors added for SeaweedFS and Scality, and the explicit
+    aws flavor, including the MD5 upload path the vendor flavors select.
+
+    Flavors with a region override (minio, garage) are excluded. They sign
+    with an artificial region string, which is a real-vendor concern, not
+    something to couple this unit test to.
+    """
+    for flavor, preset in qw_s3_client.FLAVOR_PRESETS.items():
+        if preset["region_override"]:
+            continue
+        cfg = QwS3Config.from_flavor(
+            flavor, endpoint_url=None, access_key="testing", secret_key="testing",
+        )
+        results = compat_checks.run_all_checks(QwS3Client(cfg), TEST_BUCKET)
+        for name, r in results.items():
+            assert r["passed"], f"{flavor}/{name} failed against moto: {r['detail']}"
+
+
+def test_flavors_with_identical_settings_are_probed_once(moto_s3, monkeypatch):
+    """
+    `seaweedfs` and `scality` hold the same knobs today. Running the checks
+    twice costs time and shows two identical columns in the report, so the
+    probe runs them once and reuses the result for the twin.
+    """
+    calls = []
+
+    def failing_checks(client, bucket):
+        calls.append(client.cfg.checksum_algorithm)
+        return {"path_style_addressing": {"passed": False, "detail": "refused"}}
+
+    monkeypatch.setattr(compat_checks, "run_all_checks", failing_checks)
+    monkeypatch.setattr(compat_checks, "AUTO_PROBE_ORDER", ["seaweedfs", "scality"])
+    result = compat_checks.probe_flavor(
+        endpoint_url=None, access_key="testing", secret_key="testing",
+        bucket=TEST_BUCKET, region="us-east-1",
+    )
+    assert calls == ["md5"]
+    assert result["recommended_flavor"] is None
+    assert result["attempts"]["scality"]["same_settings_as"] == "seaweedfs"
+    assert (
+        result["attempts"]["scality"]["results"]
+        == result["attempts"]["seaweedfs"]["results"]
+    )

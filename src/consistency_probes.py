@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import time
+import threading
 import uuid
 from dataclasses import asdict
 from pathlib import Path
@@ -75,26 +76,25 @@ def probe_delete_visibility(client: QwS3Client, bucket: str, prefix: str) -> dic
 
 def run_consistency_probes(client: QwS3Client, bucket: str, prefix: str,
                             duration_min: float, interval_s: float,
-                            deadline_s: float, out_path: Path):
+                            deadline_s: float, out_path: Path, stop_event=None):
+    stop_event = stop_event or threading.Event()
     end_time = time.time() + duration_min * 60
     results = []
-    while time.time() < end_time:
-        for probe_fn in (probe_read_after_write, probe_list_after_write, probe_delete_visibility):
-            t0 = time.time()
-            r = probe_fn(client, bucket, prefix)
-            r["elapsed_s"] = time.time() - t0
-            r["within_deadline"] = r["elapsed_s"] <= deadline_s
-            results.append(r)
-        time.sleep(interval_s)
-
-    with open(out_path, "w") as f:
-        for r in results:
-            f.write(json.dumps(r) + "\n")
-
+    # Write each result as it happens, preserving interrupted-run evidence.
+    with open(out_path, "x", buffering=1) as output:
+        while time.time() < end_time and not stop_event.is_set():
+            for probe_fn in (probe_read_after_write, probe_list_after_write, probe_delete_visibility):
+                if stop_event.is_set():
+                    break
+                t0 = time.time()
+                r = probe_fn(client, bucket, prefix)
+                r["ts"] = t0
+                r["elapsed_s"] = time.time() - t0
+                r["within_deadline"] = r["elapsed_s"] <= deadline_s
+                results.append(r)
+                output.write(json.dumps(r) + "\n")
+            stop_event.wait(min(interval_s, max(0, end_time-time.time())))
     total = len(results)
     successes = sum(1 for r in results if r["success"] and r["within_deadline"])
-    return {
-        "total_probes": total,
-        "successes": successes,
-        "success_pct": (100.0 * successes / total) if total else 0.0,
-    }
+    return {"total_probes": total, "successes": successes,
+            "success_pct": (100.0 * successes / total) if total else 0.0}

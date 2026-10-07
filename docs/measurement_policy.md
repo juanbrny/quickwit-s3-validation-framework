@@ -1,0 +1,213 @@
+# Measurement policy
+
+This page is the normative reference. It states exactly how each number is
+computed and how each verdict is decided. Read
+[Run a validation](run_a_validation.md) to run the tool, and
+[Read the report](read_the_report.md) to interpret the output.
+
+Every threshold here lives in `config/tiers.yaml` and is copied into each run's
+`manifest.json`. A report uses the thresholds saved with its own run, never the
+current contents of the configuration file.
+
+Abbreviations used below: Amazon Web Services (AWS), Simple Storage Service
+(S3), JavaScript Object Notation (JSON), 99th percentile (p99).
+
+## Verdicts
+
+Per criterion:
+
+- **PASS:** the criterion has adequate evidence and meets its threshold.
+- **FAIL:** an evaluated criterion violates its threshold.
+- **NOT RUN:** the required measurement or stage is absent.
+- **INCONCLUSIVE:** evidence is insufficient, invalid, interrupted or
+  incompatible.
+
+Overall:
+
+- Any required criterion FAIL gives NOT CERTIFIED.
+- Otherwise, any required criterion that is not PASS gives INCONCLUSIVE.
+- All required criteria PASS gives CERTIFIED with the `none` or `aws` flavor,
+  and CERTIFIED WITH DEVIATION with any other flavor.
+
+Optional diagnostics never determine the overall verdict. Malformed input
+reports an explicit validation error, never a passing verdict.
+
+## Current simulator limit
+
+Merge processing is synchronous inside the indexer workers. There is no
+independent queue that measures merge backlog under a fixed offered ingestion
+rate. The merge-backlog criterion is therefore always NOT RUN, and the overall
+verdict cannot reach CERTIFIED.
+
+There is deliberately no flag to hide or bypass this missing evidence.
+Implement independent merge scheduling and backlog telemetry before enabling
+that gate. Merged payloads are also capped at 64 MiB, which the report states.
+
+## Evidence policy
+
+Stages are write-once. A lock prevents two commands from modifying one
+manifest at the same time. A crash may leave a `.running` file; start a fresh
+experiment rather than appending to interrupted measurements. Reports can still
+inspect partial bundles.
+
+Checksums detect accidental change. They do not establish authenticity and do
+not detect deliberate tampering.
+
+## Sampling
+
+- `minimum_p99_samples`: 100 vendor and 100 reference observations per
+  operation. This is an evidence floor, not a statistical confidence
+  guarantee. Sparse merge or deletion samples may need substantially longer
+  runs.
+- `window_seconds`: 60 seconds, for sustained throughput and throttling.
+- `minimum_complete_windows`: 3, before any sustained-rate criterion can pass.
+
+## Latency
+
+Percentiles use linear interpolation and include the latency of failed
+operations. The vendor and the AWS reference use the same definition.
+
+Latency includes client retry time. The underlying client retries requests, so
+recorded error and throttle rates describe final outcomes and can hide
+intermediate retried failures. Every report prints this limit.
+
+Full S3 object reads use the explicit `full_get_p99_multiplier_vs_aws` policy,
+2× by default. Other latency multipliers and limits come from the rest of the
+pass/fail configuration.
+
+Headroom is the measurement divided by its own limit. For an "at least"
+requirement the ratio is inverted, so a value above 1.00× always means the
+criterion failed.
+
+## Throughput
+
+Throughput counts successful original indexer writes only. It excludes merge
+rewrite bytes. The rate is measured in MiB/s and compared against the modelled
+indexed-byte ingestion rate, not against all S3 traffic and not against raw log
+volume.
+
+Every complete window must reach 95% of its target. Idle windows count as zero
+throughput. A partial final window appears in the timeline but is not gated.
+Startup is included; mixed-workload measurements have no hidden warm-up
+exclusion.
+
+Successful simulated query rate is evaluated separately, the same way.
+
+## Throttling
+
+Throttling uses each operation's non-empty complete windows. The worst window
+must be at or below the configured sustained maximum, and the median window
+must be zero. Empty operation windows are excluded, and coverage is checked as
+its own criterion.
+
+Non-throttle errors exclude throttles, which are evaluated separately.
+
+## Concurrency sweeps
+
+Each sweep keeps the median-duration trial at every concurrency level. The
+report shows the actual levels, object sizes and repeat count. Both the read
+and the write sweep are evaluated.
+
+Missing or invalid measurements cannot pass, and neither can any non-throttle
+error. Conclusions apply only to the concurrency range actually tested.
+
+## Compatibility
+
+The probe tries flavors in order and stops at the first one where every check
+passes. Later flavors are NOT RUN. Flavors that hold identical settings are
+checked once, and the result is reused for the twin.
+
+A flavor this framework adds, rather than one Quickwit ships, cannot be
+selected by name in Quickwit's configuration. The report says so and prints the
+explicit `storage.s3.*` block instead.
+
+## Consistency
+
+Deadlines are recomputed from the recorded `elapsed_s` using the policy saved
+with the run. Each probe performs one immediate follow-up operation. It does
+not poll repeatedly until an object becomes visible.
+
+The read-after-write probe checks the returned length, not full payload
+equality. Do not read it as a corruption test.
+
+## The AWS reference run
+
+`--baseline` accepts a versioned AWS run directory. The evaluator checks the
+AWS hostname, completed load status, artifact checksums, a default flavor
+(`none` or `aws`), tier, duration, modelled workload, query profiles, source
+fingerprint, Python and dependency versions, CPU count, architecture, operating
+system, and an explicit runner network location.
+
+Any difference keeps the relative latency criteria inconclusive. The report
+shows the reference identity, dates and settings.
+
+Matching metadata does not prove identical network conditions. Inspect the
+reference context when interpreting results. Running both legs with
+`certify --with-aws-baseline` satisfies every field except the hostname check by
+construction.
+
+## Historical comparison
+
+`--previous path/to/report.json` adds an informational p99 comparison against
+an earlier report. A change is shown only when the endpoint, bucket, region,
+tier, flavor, workload, configuration, requested duration and runner location
+all match. Positive percentages mean latency increased.
+
+History never substitutes for the AWS reference and never changes the verdict.
+
+## External compliance evidence
+
+Run the relevant `s3-tests` or `mint` subset separately. Supply a JSON manifest
+and the matching raw result file:
+
+```json
+{
+  "tool": "s3-tests",
+  "version": "the exact tool commit or release",
+  "executed_at": "2026-10-07T09:00:00Z",
+  "endpoint": "https://s3.vendor.example.com",
+  "bucket": "qw-cert",
+  "selection": "multipart, range, delete_multi, list_objects",
+  "passed": 120,
+  "failed": 0,
+  "skipped": 0,
+  "evidence_file": "s3-tests-results.txt"
+}
+```
+
+The evidence path is relative to that manifest. Add
+`--compliance compliance.json` to the report command. The endpoint and bucket
+must match the run, at least one check must pass, and any failure or skipped
+relevant test prevents a pass.
+
+The report records the SHA-256 fingerprint of both the manifest and the raw
+file. This is an operator declaration with attached evidence. The report does
+not parse the suite output and does not re-execute it. Keep the original files
+with the report package.
+
+Raw `warp` reports stay an optional external diagnostic. The report states
+explicitly when they are absent.
+
+## Portability and credentials
+
+Manifests use an allowlist of settings. Access keys and secret keys are never
+serialized. Endpoint URLs containing embedded credentials, query strings or
+fragments are rejected. Arbitrary exceptions are recorded by their type only.
+
+The report HTML escapes all dynamic content, sets a restrictive content
+security policy, and uses no content delivery network, remote font or remote
+JavaScript. Raw evidence is intended for technical review. Avoid putting
+secrets into external tool output or free-text runner labels.
+
+## Appendix: migrating from the legacy reports
+
+Legacy endpoint and tier filenames do not carry enough provenance. They cannot
+establish a run identity, and they cannot reliably recover settings, dates and
+configuration. They are not imported into certification automatically.
+
+- Replace `report --tier ... --endpoint ...` with `report --run-dir ...`.
+- Supply the baseline during report generation, not during `load`.
+- The old compatibility `--baseline-out` format was never a performance
+  baseline and is no longer used.
+- The legacy Markdown renderer in `src/report.py` remains a diagnostic
+  interface. It cannot certify unversioned evidence.

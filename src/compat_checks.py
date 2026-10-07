@@ -4,7 +4,7 @@ specific S3 behaviors Quickwit's `storage.s3.*` config knobs exist to route
 around (docs/01_s3_interaction_analysis.md section 2).
 
 Each check returns (passed: bool, detail: str). `probe_flavor()` tries the
-built-in Quickwit flavor presets in order and reports the first one that
+built-in Quickwit flavors in order and reports the first one that
 gets every check passing, mirroring exactly how a user would pick
 `storage.s3.flavor: <x>` in their own config.
 """
@@ -12,7 +12,12 @@ from __future__ import annotations
 
 import uuid
 
-from .qw_s3_client import AUTO_PROBE_ORDER, QwS3Client, QwS3Config
+from .qw_s3_client import (
+    AUTO_PROBE_ORDER,
+    QwS3Client,
+    QwS3Config,
+    flavor_signature,
+)
 
 
 def check_path_style_addressing(client: QwS3Client, bucket: str) -> tuple[bool, str]:
@@ -110,13 +115,23 @@ def run_all_checks(client: QwS3Client, bucket: str) -> dict:
 def probe_flavor(endpoint_url: str, access_key: str, secret_key: str, bucket: str,
                   region: str = "us-east-1") -> dict:
     """
-    Try Quickwit's built-in flavor presets in order; return the first one
+    Try every known flavor in order; return the first one
     where every check passes, plus the full per-flavor results for the
     report. This directly answers "what storage.s3.yaml block should this
     vendor's users ship?"
     """
     attempts = {}
+    # Some flavors hold the same knob values, for example `seaweedfs` and
+    # `scality`. Probing them twice costs time and shows two identical
+    # columns in the report. Copy the earlier result instead, and say so.
+    by_signature = {}
     for flavor in AUTO_PROBE_ORDER:
+        signature = flavor_signature(flavor)
+        twin = by_signature.get(signature)
+        if twin:
+            attempts[flavor] = dict(attempts[twin], same_settings_as=twin)
+            continue
+        by_signature[signature] = flavor
         cfg = QwS3Config.from_flavor(flavor, endpoint_url, access_key, secret_key, region)
         client = QwS3Client(cfg)
         try:

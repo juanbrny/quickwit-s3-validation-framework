@@ -1,5 +1,34 @@
 # CLAUDE.md
 
+## Current workflow
+
+Read `docs/run_a_validation.md`, `docs/read_the_report.md` and
+`docs/measurement_policy.md` before changing the CLI or the report.
+`docs/reporting.md` is now just an index to those three.
+
+`certify` is the primary entry point. It chains compat, read-concurrency,
+write-concurrency, load and report into one versioned `--run-dir`, carries the
+recommended flavor forward, and optionally runs the AWS baseline leg from the
+same host. The per-stage commands still exist for manual control.
+
+Connection settings fall back to environment variables (`QW_S3_*`, then
+`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`). `src/run_store.py` owns
+write-once metadata, `src/report_model.py` evaluates required evidence, and
+`src/report_render.py` renders HTML/JSON/Markdown.
+
+Report structure: every criterion carries a `group` (one of the four questions
+in `QUESTIONS`) and a `ratio` (headroom, where at most 1.0 passes). The 27
+per-operation criteria are rendered once as the operations matrix, not as rows
+in the criteria tables. `headline_limits` states the certification ceiling in
+one place; do not restate it in `limitations` or in the docs.
+
+Missing evidence is NOT RUN or INCONCLUSIVE, never PASS. The synchronous
+simulator cannot measure merge backlog, so `best_possible_verdict` is
+INCONCLUSIVE and full certification stays blocked.
+
+Use one word per concept: `flavor`, never "preset". `FLAVOR_PRESETS` keeps its
+name because it holds the preset values of a flavor.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## What this is
@@ -21,8 +50,9 @@ and `warp` — see `external_tools/README.md`.
 The framework has three layers. Run them in sequence, and gate each layer
 on the previous one passing. There is no point load-testing an endpoint
 that fails basic multipart or range-GET (range GET request) semantics.
+`certify` enforces this order.
 1. **Compliance + compatibility knobs** (`compat_checks.py`, fast)
-2. **Concurrency fan-out sweep** (`concurrency_fanout.py`, fast, seconds)
+2. **Concurrency fan-out sweep** (`concurrency_fanout.py`, `put_fanout.py`, seconds)
 3. **Workload-shaped load test at a throughput tier** (`ingest_merge_sim.py` + `query_sim.py`, longer soak)
 
 ## Commands
@@ -38,11 +68,22 @@ pytest tests/ -v
 pytest tests/test_compat_checks.py -v                       # single file
 pytest tests/test_compat_checks.py::test_probe_flavor -v    # single test
 
-# Run certification against a real vendor endpoint (see README.md Quick Start for full flow)
-python run_certification.py compat  --endpoint <url> --bucket <b> --access-key $AK --secret-key $SK --flavor auto
-python run_certification.py fanout  --endpoint <url> --bucket <b> --access-key $AK --secret-key $SK
-python run_certification.py load    --endpoint <url> --bucket <b> --access-key $AK --secret-key $SK --tier 1TB --duration-min 30 --baseline baseline_1TB_aws.json
-python run_certification.py report  --tier 1TB --out report_1TB.md
+# Preview the report layout with synthetic data, no S3 calls
+python examples/make_sample_report.py --out-dir reports/example
+
+# Validate a real endpoint. QW_S3_ENDPOINT, QW_S3_BUCKET, QW_S3_ACCESS_KEY and
+# QW_S3_SECRET_KEY replace the connection flags.
+python run_certification.py certify --tier 100GB --duration-min 1 --levels 1,8,16 --repeats 1
+python run_certification.py certify --tier 1TB --duration-min 30 \
+  --runner-location <label> --with-aws-baseline --aws-bucket <b> \
+  --aws-access-key $AWS_AK --aws-secret-key $AWS_SK
+
+# Or stage by stage, sharing one --run-dir
+python run_certification.py compat            --run-dir <dir>
+python run_certification.py read-concurrency  --run-dir <dir> --flavor <f>
+python run_certification.py write-concurrency --run-dir <dir> --flavor <f>
+python run_certification.py load              --run-dir <dir> --flavor <f> --tier 1TB --duration-min 30
+python run_certification.py report            --run-dir <dir> --baseline <aws-dir>
 ```
 
 This framework requires `moto[s3]>=5.0`'s unified `mock_aws` API. Older
@@ -62,9 +103,15 @@ simulation or probe, and writes raw JSON (JavaScript Object Notation) to
 - **`qw_s3_client.py`** — a boto3 wrapper around Quickwit's `storage.s3.*`
   settings (`force_path_style`, `disable_multi_object_delete`,
   `disable_multipart_upload`, `checksum_algorithm`, region override).
-  `FLAVOR_PRESETS` transcribes known vendor presets (minio, garage,
-  digital_ocean, gcs) from Quickwit's `storage-config.md`. This module
-  does not reimplement Quickwit's Rust storage layer. Instead, it
+  `FLAVOR_PRESETS` transcribes the upstream flavors (minio, garage,
+  digital_ocean, gcs) from Quickwit's `storage-config.md`. It adds local
+  flavors Quickwit does not cover (seaweedfs, scality) and `aws`, which
+  keeps every AWS default so AWS S3 can be the endpoint under test, not
+  only the baseline. `UPSTREAM_FLAVORS`, `DEFAULT_FLAVORS` and
+  `flavor_note()` keep those groups apart: only `none` and `aws` certify
+  without deviation, and a local flavor's report tells the user to ship the
+  explicit `storage.s3.*` block, since Quickwit will not accept the flavor
+  name. This module does not reimplement Quickwit's Rust storage layer. Instead, it
   reproduces the same behavioral choices through boto3, so the compat
   probe can find which setting combination makes an endpoint work. That
   combination becomes the recommended configuration shipped to the

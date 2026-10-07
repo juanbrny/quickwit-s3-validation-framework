@@ -37,23 +37,17 @@ from pathlib import Path
 from typing import Optional
 
 import aioboto3
-from botocore.client import Config as BotoConfig
 from botocore.exceptions import ClientError
 
 from .concurrency_fanout import FanoutLevelResult, DEFAULT_LEVEL_REPEATS
-from .qw_s3_client import QwS3Config, checksum_kwargs_for
+from .qw_s3_client import QwS3Config, boto_config, checksum_kwargs_for
 
 DEFAULT_CONCURRENCY_LEVELS = [1, 8, 16, 32, 64, 128]
 DEFAULT_PUT_SIZE_KB = 512  # a small immature-split-sized commit, per docs/03
 
 
 def _async_client_kwargs(cfg: QwS3Config, top_concurrency: int) -> dict:
-    boto_cfg = BotoConfig(
-        signature_version="s3v4",
-        s3={"addressing_style": "path" if cfg.force_path_style else "auto"},
-        max_pool_connections=max(top_concurrency * 2, 20),
-        retries={"max_attempts": 3, "mode": "standard"},
-    )
+    boto_cfg = boto_config(cfg, max(top_concurrency * 2, 20))
     return dict(
         endpoint_url=cfg.endpoint_url,
         aws_access_key_id=cfg.access_key,

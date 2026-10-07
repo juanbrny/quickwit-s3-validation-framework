@@ -46,6 +46,7 @@ or fast trial cannot flip the verdict on its own.
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import random
 import statistics
@@ -55,10 +56,10 @@ from pathlib import Path
 from typing import Optional
 
 import aioboto3
-from botocore.client import Config as BotoConfig
 from botocore.exceptions import ClientError
 
-from .qw_s3_client import QwS3Client, QwS3Config
+from .qw_s3_client import QwS3Client, QwS3Config, boto_config
+from .report import _percentile
 
 DEFAULT_CONCURRENCY_LEVELS = [1, 8, 16, 32, 64, 128, 256, 512, 1024]
 RANGE_SIZE_BYTES = 8 * 1024  # matches query_sim's term/field lookup size
@@ -82,9 +83,7 @@ class FanoutLevelResult:
     def p99_per_request_s(self) -> float:
         if not self.per_request_latencies_s:
             return float("nan")
-        s = sorted(self.per_request_latencies_s)
-        idx = min(len(s) - 1, int(len(s) * 0.99))
-        return s[idx]
+        return _percentile(self.per_request_latencies_s, 99)
 
     @property
     def efficiency(self) -> float:
@@ -119,12 +118,7 @@ def _async_client_kwargs(cfg: QwS3Config, top_concurrency: int) -> dict:
     aiohttp's own connector limit is never what caps observed concurrency
     -- the async equivalent of the old build_fanout_client()'s job.
     """
-    boto_cfg = BotoConfig(
-        signature_version="s3v4",
-        s3={"addressing_style": "path" if cfg.force_path_style else "auto"},
-        max_pool_connections=max(top_concurrency * 2, 20),
-        retries={"max_attempts": 3, "mode": "standard"},
-    )
+    boto_cfg = boto_config(cfg, max(top_concurrency * 2, 20))
     return dict(
         endpoint_url=cfg.endpoint_url,
         aws_access_key_id=cfg.access_key,
@@ -244,15 +238,15 @@ def summarize_fanout(results: list, efficiency_floor: float = 0.4) -> dict:
         eff = r.efficiency
         rows.append({
             "concurrency": r.concurrency,
-            "wall_clock_s": round(r.wall_clock_s, 4),
-            "p50_per_request_s": round(r.p50_per_request_s, 4),
-            "p99_per_request_s": round(r.p99_per_request_s, 4),
-            "efficiency": round(eff, 3) if eff == eff else None,  # NaN check
+            "wall_clock_s": r.wall_clock_s if math.isfinite(r.wall_clock_s) else None,
+            "p50_per_request_s": r.p50_per_request_s if math.isfinite(r.p50_per_request_s) else None,
+            "p99_per_request_s": r.p99_per_request_s if math.isfinite(r.p99_per_request_s) else None,
+            "efficiency": eff if math.isfinite(eff) else None,
             "error_count": r.error_count,
             "throttle_count": r.throttle_count,
         })
-        if degrades_at is None and r.concurrency > 1:
-            if r.throttle_count > 0 or (eff == eff and eff < efficiency_floor):
+        if degrades_at is None:
+            if r.error_count > 0 or r.throttle_count > 0 or not math.isfinite(eff) or eff < efficiency_floor:
                 degrades_at = r.concurrency
     return {"levels": rows, "degrades_at_concurrency": degrades_at, "efficiency_floor": efficiency_floor}
 

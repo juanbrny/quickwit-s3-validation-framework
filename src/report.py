@@ -7,11 +7,14 @@ scripts (see README quick-start step 2).
 from __future__ import annotations
 
 import json
+import math
 import statistics
 from pathlib import Path
 from typing import Optional
 
 import yaml
+
+from .qw_s3_client import DEFAULT_FLAVORS, flavor_note
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "tiers.yaml"
 
@@ -25,13 +28,15 @@ def _load_jsonl(path: Path) -> list[dict]:
 
 def _percentile(values: list[float], pct: float) -> float:
     if not values:
-        return float("nan")
+        return None
+    if not 0 <= pct <= 100 or any(not math.isfinite(v) or v < 0 for v in values):
+        raise ValueError("Percentiles require finite, non-negative measurements and a percentile in [0, 100].")
     s = sorted(values)
     k = (len(s) - 1) * (pct / 100.0)
     f, c = int(k), min(int(k) + 1, len(s) - 1)
     if f == c:
         return s[f]
-    return s[f] + (s[c] - f) * (s[c] - s[f])  # linear interpolation guard
+    return s[f] + (k - f) * (s[c] - s[f])
 
 
 def summarize_ops(rows: list[dict]) -> dict:
@@ -49,6 +54,7 @@ def summarize_ops(rows: list[dict]) -> dict:
             "count": len(op_rows),
             "error_count": len(errors),
             "error_pct": 100.0 * len(errors) / len(op_rows) if op_rows else 0.0,
+            "non_throttle_error_pct": 100.0 * (len(errors) - len(throttles)) / len(op_rows),
             "throttle_count": len(throttles),
             "throttle_pct": 100.0 * len(throttles) / len(op_rows) if op_rows else 0.0,
             "p50_latency_s": _percentile(latencies, 50),
@@ -65,8 +71,9 @@ def compare_to_baseline(vendor_summary: dict, baseline_summary: Optional[dict],
         b = (baseline_summary or {}).get(op)
         checks = []
 
-        checks.append(("error_rate", v["error_pct"] <= bands["error_rate_max_pct"],
-                        f"{v['error_pct']:.3f}% (max {bands['error_rate_max_pct']}%)"))
+        error_pct = v.get("non_throttle_error_pct", v["error_pct"])
+        checks.append(("error_rate", error_pct <= bands["error_rate_max_pct"],
+                        f"{error_pct:.3f}% non-throttle (max {bands['error_rate_max_pct']}%)"))
         checks.append(("throttle_rate", v["throttle_pct"] <= bands["throttle_rate_sustained_max_pct"],
                         f"{v['throttle_pct']:.3f}% (max {bands['throttle_rate_sustained_max_pct']}%)"))
 
@@ -81,17 +88,19 @@ def compare_to_baseline(vendor_summary: dict, baseline_summary: Optional[dict],
             elif "put" in op or "multipart" in op:
                 multiplier_key = "put_p99_multiplier_vs_aws"
 
-            if multiplier_key and b["p99_latency_s"] > 0:
+            if multiplier_key and b.get("p99_latency_s") is not None and b["p99_latency_s"] > 0:
                 ratio = v["p99_latency_s"] / b["p99_latency_s"]
                 max_mult = bands[multiplier_key]
                 checks.append((f"p99_vs_aws_{multiplier_key}", ratio <= max_mult,
                                 f"{ratio:.2f}x AWS baseline (max {max_mult}x); "
                                 f"vendor p99={v['p99_latency_s']*1000:.1f}ms, "
                                 f"aws p99={b['p99_latency_s']*1000:.1f}ms"))
+            elif multiplier_key:
+                checks.append(("baseline_comparison", None, "invalid or zero baseline p99"))
         else:
             checks.append(("baseline_comparison", None, "no AWS baseline provided for this op"))
 
-        passed = all(c[1] for c in checks if c[1] is not None)
+        passed = bool(checks) and all(c[1] is True for c in checks)
         verdicts[op] = {"passed": passed, "checks": checks, "raw": v}
     return verdicts
 
@@ -105,12 +114,16 @@ def render_markdown_report(tier: str, endpoint: str, compat_result: dict,
     lines.append("## Layer 2 — Compatibility knobs")
     rec = compat_result.get("recommended_flavor")
     if rec:
-        lines.append(f"**Recommended `storage.s3.flavor`:** `{rec}`")
+        lines.append(f"**Recommended flavor:** `{rec}`")
+        note = flavor_note(rec)
+        if note:
+            lines.append("")
+            lines.append(note)
         yaml_block = compat_result["attempts"][rec].get("yaml")
         if yaml_block:
             lines.append("\n```yaml\n" + yaml_block + "\n```")
         lines.append("")
-        verdict = "PASS" if rec == "none" else "PASS WITH DEVIATION"
+        verdict = "PASS" if rec in DEFAULT_FLAVORS else "PASS WITH DEVIATION"
         lines.append(f"**Verdict: {verdict}**\n")
     else:
         lines.append("**No working flavor/config combination found. Verdict: FAIL**\n")
@@ -118,6 +131,9 @@ def render_markdown_report(tier: str, endpoint: str, compat_result: dict,
     for flavor, attempt in compat_result.get("attempts", {}).items():
         lines.append(f"<details><summary>{flavor}: "
                       f"{'all checks passed' if attempt.get('all_passed') else 'failed'}</summary>\n")
+        if attempt.get("same_settings_as"):
+            lines.append(f"- same settings as `{attempt['same_settings_as']}`, "
+                          "so its result is reused")
         if "results" in attempt:
             for name, r in attempt["results"].items():
                 mark = "✅" if r["passed"] else "❌"
@@ -173,7 +189,11 @@ def render_markdown_report(tier: str, endpoint: str, compat_result: dict,
             lines.append(f"- **Verdict: PASS**\n")
 
     lines.append("## Overall\n")
-    final = overall_pass and consistency_pass and fanout_pass and (rec is not None)
+    # Legacy input has no run identity, complete gate coverage, or configuration
+    # provenance. Only the versioned report pipeline may issue certification.
+    final = False
+    lines.append("Legacy diagnostic only: run metadata and required evidence are unavailable. "
+                 "Use `report --run-dir` for the complete evaluated report.")
     if final and rec == "none":
         lines.append(f"### CERTIFIED for {tier} (default configuration)")
     elif final:
@@ -214,7 +234,7 @@ def render_compat_markdown(compat_result: dict, out_path: Path):
     lines = [
         "# S3 API Compatibility Check",
         "",
-        "One row per check, one column per `storage.s3.flavor` attempted. "
+        "One row per check, one column per flavor attempted. "
         "See docs/01_s3_interaction_analysis.md section 2 for what each check "
         "corresponds to in Quickwit's own storage config.",
         "",
@@ -225,7 +245,7 @@ def render_compat_markdown(compat_result: dict, out_path: Path):
         out_path.write_text("\n".join(lines))
         return
 
-    header = "| Check | " + " | ".join(f"`flavor: {f}`" for f in flavors) + " |"
+    header = "| Check | " + " | ".join(f"`{f}`" for f in flavors) + " |"
     sep = "|---|" + "---|" * len(flavors)
     lines += [header, sep]
 
@@ -239,9 +259,20 @@ def render_compat_markdown(compat_result: dict, out_path: Path):
                 row.append("\u2705" if r["passed"] else "\u274c")
         lines.append("| " + " | ".join(row) + " |")
 
+    twins = {f: a["same_settings_as"] for f, a in attempts.items()
+              if a.get("same_settings_as")}
+    if twins:
+        lines.append("")
+        for f, twin in twins.items():
+            lines.append(f"`{f}` holds the same settings as `{twin}`. "
+                          "The probe runs the checks once and reuses the result.")
     lines.append("")
     if rec:
-        lines.append(f"**Recommended: `storage.s3.flavor: {rec}`**")
+        lines.append(f"**Recommended flavor: `{rec}`**")
+        note = flavor_note(rec)
+        if note:
+            lines.append("")
+            lines.append(note)
         yaml_block = attempts[rec].get("yaml")
         if yaml_block:
             lines.append("\n```yaml\n" + yaml_block + "\n```")
@@ -253,8 +284,8 @@ def render_compat_markdown(compat_result: dict, out_path: Path):
         )
     else:
         lines.append(
-            "**No working flavor/config combination found.** None of Quickwit's built-in "
-            "flavor presets get every check passing against this endpoint -- see the "
+            "**No working flavor/config combination found.** None of the "
+            "flavors get every check passing against this endpoint -- see the "
             "per-flavor detail in the accompanying `compat_*.json` for which checks failed "
             "and why, since that's the starting point for a custom `storage.s3.*` override."
         )

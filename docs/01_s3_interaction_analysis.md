@@ -28,18 +28,31 @@ breaks against non-Amazon Web Services (AWS) S3 implementations. It
 documents a `flavor` system, with options `digital_ocean`, `garage`, `gcs`,
 and `minio`. Each flavor works around a behavior gap in a specific provider.
 
+This framework adds its own flavors for vendors Quickwit does not cover:
+`seaweedfs` and `scality`. It also adds `aws`, which keeps every AWS default,
+so a run against AWS S3 itself is named as such. Quickwit does not accept
+`seaweedfs` or `scality` as a `flavor` value. For those two, the report
+prints the explicit `storage.s3.*` block to ship instead.
+
 Quickwit also ships a set of manual override flags. Each knob below maps to
 a concrete, testable requirement.
 
 | Config knob | What it controls | Who needs it, per Quickwit's own docs |
 |---|---|---|
-| `force_path_style_access` | Path-style (`https://host/bucket/key`) vs. virtual-hosted (`https://bucket.host/key`) addressing | Ceph, MinIO |
+| `force_path_style_access` | Path-style (`https://host/bucket/key`) vs. virtual-hosted (`https://bucket.host/key`) addressing | Ceph, MinIO, SeaweedFS, Scality |
 | `disable_multi_object_delete` | Falls back from bulk `DeleteObjects` (up to 1000 keys/request) to per-object `DeleteObject` | Google Cloud Storage (GCS), Digital Ocean |
 | `disable_multipart_upload` | Falls back to single-shot `PutObject` for large splits | GCS |
-| `checksum_algorithm` (`crc32c` \| `md5` \| `disabled`) | Whether upload integrity uses the AWS software development kit (SDK)'s Cyclic Redundancy Check (CRC32C) trailer, the legacy `Content-MD5` header, or no checksum | Providers that came before `x-amz-checksum-*` support need `md5` or `disabled` |
+| `checksum_algorithm` (`crc32c` \| `md5` \| `disabled`) | Whether upload integrity uses the AWS software development kit (SDK)'s Cyclic Redundancy Check (CRC32C) trailer, the legacy `Content-MD5` header, or no checksum | Providers that came before `x-amz-checksum-*` support need `md5` or `disabled`. This includes released versions of SeaweedFS and Scality |
 | Region override (for example, forced to the literal string `garage` or `minio`) | Some providers require a specific, or dummy, region string to pass Signature Version 4 (SigV4) validation | Garage, MinIO |
 | `endpoint` | Custom (non-AWS) endpoint URL | All non-AWS providers |
 | `QW_S3_MAX_CONCURRENCY` | Caps concurrent in-flight S3 requests | Adjustable, based on each provider's connection-handling capacity |
+
+One more detail decides whether the `checksum_algorithm` setting works at
+all. botocore 1.36 and later add their own CRC32 trailer to every upload,
+even when the caller asks for Content-MD5 or for no checksum. The framework
+sets `request_checksum_calculation="when_required"` on every client it
+builds, so only the selected checksum reaches the endpoint. See
+`boto_config()` in `src/qw_s3_client.py`.
 
 **This is the highest-value part of the test suite.** Most "Quickwit doesn't
 work with our S3" reports trace back to one of these five knobs. They rarely
@@ -220,6 +233,11 @@ This has two direct consequences for the test suite:
 ## References
 
 - Quickwit storage configuration docs (`flavor`, override flags): `https://quickwit.io/docs/configuration/storage-config`
+- SeaweedFS S3 route table, showing multi-object delete, multipart and the virtual-host condition: `https://github.com/seaweedfs/seaweedfs/blob/master/weed/s3api/s3api_server.go`
+- SeaweedFS corrupts objects when the SDK sends a default trailing checksum: `https://github.com/seaweedfs/seaweedfs/issues/6548`
+- Scality supported S3 operations, including Multi-Object Delete and multipart: `https://downloads.scality.com/artesca-ova/doc/reference/s3/index.html`
+- Scality CloudServer rejects trailing checksums with 400 BadRequest: `https://github.com/scality/cloudserver/issues/5553`
+- Scality endpoint addressing, and the DNS and certificate setup virtual-hosted style needs: `https://s3-server.readthedocs.io/en/latest/GETTING_STARTED.html`
 - Quickwit AWS cost optimization guide (PUT/GET formulas, commit/merge defaults): `https://quickwit.io/docs/operating/aws-costs`
 - Quickwit metastore configuration docs (file-backed consistency/locking): `https://quickwit.io/docs/configuration/metastore-config`
 - Quickwit GitHub issue #12 (original file-backed metastore design rationale): `https://github.com/quickwit-oss/quickwit/issues/12`

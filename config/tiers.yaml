@@ -73,6 +73,7 @@ pass_fail_bands:
   throttle_rate_sustained_max_pct: 1.0
   put_p99_multiplier_vs_aws: 2.0
   range_get_p99_multiplier_vs_aws: 2.0
+  full_get_p99_multiplier_vs_aws: 2.0  # merge reads; explicit reporting policy
   bulk_delete_p99_multiplier_vs_aws: 3.0
   query_wall_clock_p99_multiplier_vs_aws: 2.5
   sustained_throughput_min_pct_of_target: 95.0
@@ -87,3 +88,9 @@ pass_fail_bands:
                                     # independent PUTs (indexer commits) instead of
                                     # concurrent range-GETs (queries)
   put_fanout_concurrency_levels: [1, 8, 16, 32, 64, 128]
+
+# Snapshotted with each run; changing this file cannot change old reports.
+reporting:
+  minimum_p99_samples: 100
+  window_seconds: 60
+  minimum_complete_windows: 3

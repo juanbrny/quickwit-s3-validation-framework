@@ -35,16 +35,31 @@ def cmd_compat(args, run):
     from src.report import render_compat_markdown
 
     result = probe_flavor(
-        args.endpoint, args.access_key, args.secret_key, args.bucket, args.region
+        args.endpoint,
+        args.access_key,
+        args.secret_key,
+        args.bucket,
+        args.region,
+        verify_tls=tls_setting(args),
     )
     write_json(run.path / "compat.json", result)
     render_compat_markdown(result, run.path / "compat.md")
     run.record["recommended_flavor"] = result["recommended_flavor"]
     run.record["required_checks"] = [name for name, _ in CHECKS]
     print(f"Recommended flavor: {result['recommended_flavor']}")
+    same = result.get("equivalent_flavors")
+    if same:
+        print("The same settings are also named: " + ", ".join(same))
     note = flavor_note(result["recommended_flavor"])
     if note:
         print(note)
+
+
+def tls_setting(args):
+    """What to verify the endpoint certificate against."""
+    if getattr(args, "insecure_skip_tls_verify", False):
+        return False
+    return getattr(args, "ca_bundle", None) or True
 
 
 def client_config(args, run, concurrency=50):
@@ -57,6 +72,7 @@ def client_config(args, run, concurrency=50):
         args.secret_key,
         args.region,
         max_concurrency=concurrency,
+        verify_tls=tls_setting(args),
     )
     run.record["effective_config"] = public_config(cfg)
     run.save()
@@ -64,7 +80,7 @@ def client_config(args, run, concurrency=50):
 
 
 def cmd_sweep(args, run):
-    from src.qw_s3_client import QwS3Client
+    from src.qw_s3_client import QwS3Client, ensure_file_descriptors
     from src.concurrency_fanout import (
         prepare_fanout_object,
         run_fanout_sweep,
@@ -81,11 +97,16 @@ def cmd_sweep(args, run):
         or len(set(levels)) != len(levels)
     ):
         raise ValueError("Concurrency levels must be unique positive integers.")
+    # One socket per concurrent request, plus headroom for the connection pool
+    # and for dual-stack connection attempts. Check before uploading anything,
+    # so the run stops in a second rather than part way through a sweep.
+    pool = max(max(levels) * 2, 20)
+    run.record["file_descriptor_limit"] = ensure_file_descriptors(pool + 64)
     cfg = client_config(args, run)
     client = QwS3Client(cfg)
     client.ensure_bucket(args.bucket)
     run.record["tested_levels"] = levels
-    run.record["connection_pool_size"] = max(max(levels) * 2, 20)
+    run.record["connection_pool_size"] = pool
     run.save()
     prefix = f"qwcert/{run.manifest['run_id']}/{args.cmd}"
     print(f"Sweeping concurrency levels {levels}, {args.repeats} trials per level.")
@@ -283,19 +304,45 @@ def add_connection_options(parser, prefix="", defaults=ENV_DEFAULTS):
         default=env_default(names) or "us-east-1",
         help="Defaults to $" + ", $".join(names) + ", then us-east-1",
     )
+    if prefix:
+        return
+    # On-premises appliances usually present a certificate from a private
+    # certificate authority (CA). Without one of these, the run can only use
+    # plain HTTP, which is not how the endpoint runs in production.
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--ca-bundle",
+        default=env_default(("QW_S3_CA_BUNDLE", "AWS_CA_BUNDLE")),
+        help="Certificate authority bundle used to verify the endpoint."
+        " Defaults to $QW_S3_CA_BUNDLE, $AWS_CA_BUNDLE.",
+    )
+    group.add_argument(
+        "--insecure-skip-tls-verify",
+        action="store_true",
+        help="Do not verify the endpoint certificate. The report records this.",
+    )
 
 
 def require_connection(parser, args, prefix="", label="the endpoint under test"):
-    """Fail early, naming the flag and the environment variable for each gap."""
+    """Fail early, naming the flag and the environment variable for each gap.
+
+    An empty value is reported separately. A shell variable that is unset
+    expands to an empty argument, so the flag looks present on the command
+    line while carrying nothing.
+    """
     defaults = AWS_ENV_DEFAULTS if prefix else ENV_DEFAULTS
-    missing = [
-        "--" + (prefix + option).replace("_", "-")
-        + " (or $" + defaults[prefix + option][0] + ")"
-        for option in ("endpoint", "bucket", "access_key", "secret_key")
-        if not getattr(args, prefix + option, None)
-    ]
+    missing = []
+    for option in ("endpoint", "bucket", "access_key", "secret_key"):
+        value = getattr(args, prefix + option, None)
+        if value:
+            continue
+        flag = "--" + (prefix + option).replace("_", "-")
+        if value == "":
+            missing.append(f"{flag} is empty; check the shell variable you passed to it")
+        else:
+            missing.append(f"{flag}, or ${defaults[prefix + option][0]}")
     if missing:
-        parser.error(f"Missing connection settings for {label}: " + ", ".join(missing))
+        parser.error(f"Missing connection settings for {label}: " + "; ".join(missing))
 
 
 def stage_namespace(args, cmd, flavor, **extra):
@@ -310,6 +357,8 @@ def stage_namespace(args, cmd, flavor, **extra):
         run_dir=args.run_dir,
         runner_location=args.runner_location,
         flavor=flavor,
+        ca_bundle=args.ca_bundle,
+        insecure_skip_tls_verify=args.insecure_skip_tls_verify,
         **extra,
     )
 
@@ -401,6 +450,7 @@ def cmd_certify(args, config, parser):
             baseline=baseline,
             compliance=args.compliance,
             previous=args.previous,
+            reference=args.reference,
             out=args.out,
             strict=args.strict,
         )
@@ -411,11 +461,14 @@ def cmd_report(args):
     from src.report_model import build_report
     from src.report_render import write_reports
 
-    report = build_report(args.run_dir, args.baseline, args.compliance, args.previous)
+    report = build_report(
+        args.run_dir, args.baseline, args.compliance, args.previous, args.reference
+    )
     out = args.out or str(Path(args.run_dir) / "report.html")
     for file in write_reports(report, out, args.run_dir):
         print(f"Report written: {file}")
     print(f"Overall: {report['verdict']}")
+    print(f"Latency graded against: {report['reference']['basis']}")
     if args.strict and report["verdict"] not in (
         "CERTIFIED",
         "CERTIFIED WITH DEVIATION",
@@ -451,6 +504,16 @@ def parse_levels(value):
 
 
 def add_report_options(parser):
+    from src.reference_profile import DEFAULT_PROFILE, NO_PROFILE, available_profiles
+
+    parser.add_argument(
+        "--reference",
+        default=DEFAULT_PROFILE,
+        help="Bundled latency reference used when no --baseline is supplied."
+        f" One of: {', '.join(available_profiles())}, a path to a profile file,"
+        f" or {NO_PROFILE} to leave latency criteria inconclusive."
+        f" Default: {DEFAULT_PROFILE}.",
+    )
     parser.add_argument(
         "--compliance",
         help="External s3-tests or mint evidence; see docs/measurement_policy.md.",

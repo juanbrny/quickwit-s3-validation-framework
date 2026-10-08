@@ -11,9 +11,11 @@ threshold, read [Measurement policy](measurement_policy.md).
   objects under the `qwcert/` prefix.
 - An access key and a secret key with read, write and delete rights on that
   bucket.
-- Optional, but strongly recommended: an Amazon Web Services (AWS) Simple
-  Storage Service (S3) bucket for the reference run. Latency criteria stay
-  inconclusive without one.
+- No Amazon Web Services (AWS) account is needed. Latency is graded against a
+  bundled reference profile, which states what AWS Simple Storage Service (S3)
+  delivers from an instance in the same region as its bucket.
+- Optional: an AWS bucket of your own. A measured run is stronger evidence,
+  because it shares this machine and network with the run under test.
 
 ```bash
 python3 -m venv venv && source venv/bin/activate
@@ -74,10 +76,14 @@ python run_certification.py certify --tier 1TB --duration-min 30 \
    operation mix for the tier.
 5. **Report.** Writes HTML, JSON and Markdown into the run directory.
 
-With `--with-aws-baseline` it adds the same soak against AWS S3 before the
-report. Run both legs from one command whenever you can. The report only
-compares latency when the tier, duration, modelled workload, runner location
-and host environment all match, and one command makes them match.
+Without `--with-aws-baseline`, latency is graded against the bundled reference
+profile. That is the default, and it produces a full verdict.
+
+With `--with-aws-baseline`, the command adds the same soak against AWS S3 and
+grades against that instead. Prefer it when you have an AWS account. The report
+only compares a measured run when the tier, duration, modelled workload, runner
+location and host environment all match, and running both legs from one command
+makes them match.
 
 `--runner-location` is a free-text label for where the machine sits. Use the
 same label for both legs. Without it, the baseline comparison stays
@@ -91,6 +97,9 @@ Useful options:
 | `--levels 1,8,16,32` | Shorten the concurrency sweeps. |
 | `--out PATH` | Write the report somewhere other than the run directory. |
 | `--strict` | Exit with status 1 when the verdict is not certified. Useful in continuous integration. |
+| `--reference <id\|path\|none>` | Choose the bundled latency reference, supply your own profile file, or switch it off. |
+| `--ca-bundle PATH` | Verify the endpoint against a private certificate authority. On-premises appliances usually need this. |
+| `--insecure-skip-tls-verify` | Skip certificate verification. The report records that the run did it. |
 
 The 10PB tier needs `--confirm-extreme-cost`. A soak at that volume runs up a
 real cloud bill.
@@ -165,6 +174,8 @@ The HTML still opens correctly on its own.
 | `No flavor passed every compatibility check` | Read `compat.md` in the run directory. It shows which check failed under which flavor. Fix the endpoint, or build a custom `storage.s3.*` configuration. |
 | `Stage ... already exists` | Each stage runs once per directory. Use a new `--run-dir`. |
 | `This run is active or was interrupted` | A `.running` lock file remains. Start a fresh directory rather than appending to interrupted measurements. |
+| `SSLError`, or `CERTIFICATE_VERIFY_FAILED` | The endpoint presents a certificate from a private authority. Pass `--ca-bundle /path/to/ca.pem`. Use `--insecure-skip-tls-verify` only to get unblocked; plain HTTP is a worse choice, because it does not measure the endpoint as it serves production traffic. |
+| `Too many open files`, or `allows N open files per process` | The concurrency sweep needs one socket per concurrent request. The tool raises the limit itself where the system allows it. If it cannot, run `ulimit -n 4096` in that shell, or lower the top level with `--levels 1,8,16,32,64,128`. |
 
 An interrupted run keeps its partial evidence and records the stage as
 INTERRUPTED. You can still build a report from it.

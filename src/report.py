@@ -269,6 +269,14 @@ def render_compat_markdown(compat_result: dict, out_path: Path):
     lines.append("")
     if rec:
         lines.append(f"**Recommended flavor: `{rec}`**")
+        same = compat_result.get("equivalent_flavors") or []
+        if same:
+            lines.append("")
+            lines.append(
+                "The same settings also carry these names: "
+                + ", ".join(f"`{f}`" for f in same)
+                + "."
+            )
         note = flavor_note(rec)
         if note:
             lines.append("")

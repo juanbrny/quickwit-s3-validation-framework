@@ -108,6 +108,7 @@ def public_config(cfg):
             "checksum_algorithm",
             "region_override",
             "max_concurrency",
+            "verify_tls",
         )
     }
 

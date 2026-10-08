@@ -41,7 +41,12 @@ verdict cannot reach CERTIFIED.
 
 There is deliberately no flag to hide or bypass this missing evidence.
 Implement independent merge scheduling and backlog telemetry before enabling
-that gate. Merged payloads are also capped at 64 MiB, which the report states.
+that gate.
+
+Merged payloads are capped at 160 MB to limit test cost. The cap sits just
+above Quickwit's 128 MiB multipart threshold, so the soak does exercise the
+multipart path. It does not exercise a real 8 GB mature split, where transfer
+rate dominates. The report states this.
 
 ## Evidence policy
 
@@ -130,9 +135,55 @@ not poll repeatedly until an object becomes visible.
 The read-after-write probe checks the returned length, not full payload
 equality. Do not read it as a corruption test.
 
-## The AWS reference run
+## The latency reference
 
-`--baseline` accepts a versioned AWS run directory. The evaluator checks the
+Latency criteria compare against AWS S3. There are two ways to supply that
+comparison, and the report always names which one it used.
+
+**Bundled reference profile (the default).** Most vendors have no AWS account.
+The framework therefore ships the bar it grades against, in
+`config/reference_profiles/`. Select one with `--reference <id>`, give a path
+to your own file, or pass `--reference none` to leave latency criteria
+inconclusive.
+
+A profile holds two numbers, not a table of per-operation latencies:
+
+| Field | Meaning |
+|---|---|
+| `latency.first_byte_p99_s` | The 99th percentile of one small request, measured in region. This is a tail figure, because the framework compares p99 to p99. |
+| `throughput.per_stream_mb_s` | The rate one request transfers bytes at. AWS advises one concurrent request for each 85-90 MB/s wanted. |
+
+The limit for one operation then follows its own recorded payload size:
+
+```
+parts      = ceil(bytes / multipart_part_gb)        # uploads above the threshold
+throughput = min(parts, max_concurrent_parts) x per_stream_mb_s
+reference  = first_byte_p99_s + bytes / throughput
+limit      = reference x the operation's multiplier
+```
+
+Two numbers therefore cover every operation and every tier, including tiers
+nobody has measured. A small read costs one round trip. An 8 GB mature split
+read costs about 91 seconds, where the round trip is a tenth of a percent.
+
+Queries are the exception. A query finishes when the slowest of its concurrent
+reads returns, and the 99th percentile of that maximum sits above the 99th
+percentile of one read. `latency.fanout_tail_factor` covers the difference. It
+is a stated assumption, not a measurement.
+
+A profile also carries its provenance: storage class, runner, date and the
+sources behind its numbers. The report prints all of it. A profile marked
+`status: provisional` holds published figures rather than a run recorded with
+this framework, and the report says so.
+
+**Measured AWS run.** This is the stronger evidence, because it shares the
+runner, the network and the code version with the run under test. It always
+wins when supplied with `--baseline`.
+
+## The measured AWS reference run
+
+`--baseline` accepts a versioned AWS run directory. Supplying it switches off
+the bundled profile for that report. The evaluator checks the
 AWS hostname, completed load status, artifact checksums, a default flavor
 (`none` or `aws`), tier, duration, modelled workload, query profiles, source
 fingerprint, Python and dependency versions, CPU count, architecture, operating

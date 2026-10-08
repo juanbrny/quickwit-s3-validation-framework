@@ -96,8 +96,27 @@ like this:
 | Bulk deletion, Individual deletions | The janitor removing merged and expired splits. |
 
 `p99` is the latency below which 99% of recorded outcomes fall. Limits are a
-multiple of the AWS reference, not absolute numbers, so a slow network affects
-both sides equally.
+multiple of the AWS reference, not absolute numbers.
+
+**Median payload** is in the matrix because the limit depends on it. A 2 KiB
+document read is graded on round-trip time. An 8 GB merge read is graded on
+transfer rate. One reference produces both.
+
+## Which AWS reference was used
+
+The run details list a **Latency reference**, and it is one of two things.
+
+- **A reference profile.** The published bar, bundled with the framework. No
+  AWS account needed. The Evidence section prints the whole profile, including
+  where its numbers come from. This is the default.
+- **A measured AWS run.** Supplied with `--baseline`. Stronger evidence,
+  because it shares this runner and this network with the run under test.
+
+A profile states what AWS S3 delivers from an instance in the same region as
+its bucket. It cannot know how far your runner sits from the endpoint under
+test. If your runner is far away, your own results carry that distance and the
+profile does not. A measured baseline removes that gap. The report flags this
+whenever a profile is in use.
 
 ## Compatibility and the configuration to ship
 

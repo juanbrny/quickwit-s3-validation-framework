@@ -16,6 +16,7 @@ from .qw_s3_client import (
     AUTO_PROBE_ORDER,
     QwS3Client,
     QwS3Config,
+    equivalent_flavors,
     flavor_signature,
 )
 
@@ -113,7 +114,7 @@ def run_all_checks(client: QwS3Client, bucket: str) -> dict:
 
 
 def probe_flavor(endpoint_url: str, access_key: str, secret_key: str, bucket: str,
-                  region: str = "us-east-1") -> dict:
+                  region: str = "us-east-1", verify_tls=True) -> dict:
     """
     Try every known flavor in order; return the first one
     where every check passes, plus the full per-flavor results for the
@@ -132,7 +133,9 @@ def probe_flavor(endpoint_url: str, access_key: str, secret_key: str, bucket: st
             attempts[flavor] = dict(attempts[twin], same_settings_as=twin)
             continue
         by_signature[signature] = flavor
-        cfg = QwS3Config.from_flavor(flavor, endpoint_url, access_key, secret_key, region)
+        cfg = QwS3Config.from_flavor(
+            flavor, endpoint_url, access_key, secret_key, region, verify_tls=verify_tls
+        )
         client = QwS3Client(cfg)
         try:
             client.ensure_bucket(bucket)
@@ -144,5 +147,11 @@ def probe_flavor(endpoint_url: str, access_key: str, secret_key: str, bucket: st
         attempts[flavor] = {"results": results, "all_passed": all_passed,
                              "yaml": cfg.as_quickwit_yaml() if all_passed else None}
         if all_passed:
-            return {"recommended_flavor": flavor, "attempts": attempts}
-    return {"recommended_flavor": None, "attempts": attempts}
+            return {
+                "recommended_flavor": flavor,
+                # Several vendors need the same four settings. Name them all,
+                # so an operator recognises their own product.
+                "equivalent_flavors": equivalent_flavors(flavor),
+                "attempts": attempts,
+            }
+    return {"recommended_flavor": None, "equivalent_flavors": [], "attempts": attempts}

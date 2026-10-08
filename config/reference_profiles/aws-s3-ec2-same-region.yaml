@@ -1,0 +1,55 @@
+# Bundled AWS S3 reference profile.
+#
+# A vendor does not need an Amazon Web Services (AWS) account to get a verdict.
+# This file is the bar the framework grades against when no measured baseline
+# is supplied. We publish it because we define what "as fast as AWS S3" means
+# for Quickwit, and we grade ourselves against the same numbers.
+#
+# A measured baseline always wins when the operator supplies one. See
+# docs/measurement_policy.md.
+
+id: aws-s3-ec2-same-region
+version: 1
+status: provisional
+title: AWS S3 Standard, read from an EC2 instance in the same region
+
+context:
+  storage_class: S3 Standard
+  runner: EC2 instance in the same region as the bucket
+  # Replace this block with your own recorded run, then set status: published
+  # and raise the version. The structure does not change.
+  source: >-
+    Published AWS figures, not yet a run recorded with this framework.
+  references:
+    - "AWS S3 performance guidance. First-byte-out latency of roughly 100-200
+       ms for the general case."
+    - "AWS S3 best practices whitepaper. Make one concurrent request for each
+       85-90 MB/s of desired network throughput."
+    - "dvassallo/s3-benchmark, 155 instance types. The 90th percentile time to
+       first byte is around 20 ms from an in-region EC2 instance, and one
+       thread moves about 93 MB/s."
+
+latency:
+  # The 99th percentile (p99) of a small operation, measured in region. The
+  # framework compares p99 to p99, so this value is a tail figure, not a
+  # median. In region the median first byte is tens of milliseconds; the tail
+  # is what this number describes.
+  first_byte_p99_s: 0.085
+
+  # A query issues many range reads at once and completes when the slowest one
+  # returns. The p99 of that maximum is worse than the p99 of one read. This
+  # factor covers the difference. It is an assumption, not a measurement.
+  fanout_tail_factor: 2.0
+
+throughput:
+  # One request, one stream. AWS tells applications to open one concurrent
+  # request for each 85-90 MB/s they want.
+  per_stream_mb_s: 90.0
+
+  # Quickwit uploads above 128 MiB as multipart, with a 5 GiB target part size
+  # (quickwit-storage/src/object_storage/policy.rs). Parts upload at the same
+  # time, so a large upload is faster than one stream. An 8 GB mature split is
+  # two parts, and moves at roughly twice the single-stream rate.
+  multipart_threshold_mb: 128
+  multipart_part_gb: 5
+  max_concurrent_parts: 10

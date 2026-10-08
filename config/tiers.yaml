@@ -6,7 +6,8 @@ model_constants:
   compression_ratio: 2.75       # raw bytes / indexed bytes [docs: 23TB benchmark]
   commit_timeout_s: 60          # indexer flush interval [docs default]
   merge_factor: 10              # splits consolidated per merge [docs default]
-  mature_split_gb: 5            # mid of documented 1-10GB mature split range
+  mature_split_gb: 8            # typical BYOC mature split; documented range is
+                                # 1-10GB. At 8GB an upload is two 5GiB parts.
   per_core_indexing_mbps: 27    # worst-case, adversarial dataset [docs]
   multipart_part_gb: 5          # "1 PUT request / 5GB" [docs]
   s3_max_concurrency_per_node: 10000   # [pomsky] QW_S3_MAX_CONCURRENCY default

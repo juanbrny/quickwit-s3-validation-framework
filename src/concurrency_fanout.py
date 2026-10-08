@@ -125,6 +125,7 @@ def _async_client_kwargs(cfg: QwS3Config, top_concurrency: int) -> dict:
         aws_secret_access_key=cfg.secret_key,
         region_name=cfg.region,
         config=boto_cfg,
+        verify=cfg.verify_tls,
     )
 
 

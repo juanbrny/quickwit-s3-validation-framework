@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .qw_s3_client import DEFAULT_FLAVORS, same_settings
+from .reference_profile import DEFAULT_PROFILE, describe, load_profile, reference_p99
 from .report import _load_jsonl, _percentile, summarize_ops
 from .run_store import load_bundle, read_json, utc_now, digest
 
@@ -241,7 +242,9 @@ def _baseline(path, manifest, load):
     }, issues
 
 
-def build_report(run_dir, baseline=None, compliance=None, previous=None):
+def build_report(
+    run_dir, baseline=None, compliance=None, previous=None, reference=DEFAULT_PROFILE
+):
     path = Path(run_dir)
     manifest, issues = load_bundle(path)
     stages, cfg = manifest["stages"], manifest["config"]
@@ -256,6 +259,10 @@ def build_report(run_dir, baseline=None, compliance=None, previous=None):
     options = load.get("options", {})
     flavor = options.get("flavor")
     checks, measurements, errors = [], [], []
+    # Latency is graded against one of two references. A measured AWS run wins
+    # when the operator supplies one. Otherwise the bundled profile applies, so
+    # a vendor with no AWS account still gets a verdict.
+    profile = load_profile(reference) if not baseline else None
 
     def add(*args, **kwargs):
         checks.append(check(*args, **kwargs))
@@ -311,16 +318,33 @@ def build_report(run_dir, baseline=None, compliance=None, previous=None):
     if issues:
         checks[0].update(status=INCONCLUSIVE, observed="; ".join(issues))
     baseline_data, baseline_issues = _baseline(baseline, manifest, load)
+    if baseline:
+        reference_state = INCONCLUSIVE if baseline_issues else PASS
+        reference_observed = (
+            "; ".join(baseline_issues)
+            if baseline_issues
+            else "Measured AWS run with matching workload and runner metadata"
+        )
+    elif profile:
+        reference_state = PASS
+        reference_observed = (
+            f"Bundled reference profile {profile['id']} v{profile['version']}"
+            f" ({profile.get('status', 'published')})"
+        )
+    else:
+        reference_state = INCONCLUSIVE
+        reference_observed = "No latency reference selected"
     add(
         "baseline",
-        "AWS baseline comparability",
-        INCONCLUSIVE if baseline_issues else PASS,
-        "; ".join(baseline_issues)
-        if baseline_issues
-        else "Matching workload and runner metadata",
-        "Completed AWS reference using the same workload and runner",
-        "Relative latency is meaningful only when workload and measurement conditions are comparable.",
-        "Run the same workload against AWS S3 from the same runner and supply --baseline.",
+        "Latency reference",
+        reference_state,
+        reference_observed,
+        "A measured AWS run, or the bundled reference profile",
+        "Latency criteria compare against AWS S3. A measured run is the stronger"
+        " evidence, because it shares this runner and network. The bundled"
+        " profile is the published bar, and it applies when no measured run is"
+        " supplied.",
+        "Supply --baseline with a measured AWS run, or choose a profile with --reference.",
         group="evidence",
     )
 
@@ -482,14 +506,28 @@ def build_report(run_dir, baseline=None, compliance=None, previous=None):
             multiplier = bands.get("full_get_p99_multiplier_vs_aws", 2.0)
         else:
             multiplier = bands["range_get_p99_multiplier_vs_aws"]
-        reference = (baseline_data or {}).get("summary", {}).get(op, {})
-        bp99 = reference.get("p99_latency_s")
+        sizes = sorted(r.get("bytes", 0) for r in relevant)
+        median_bytes = sizes[len(sizes) // 2] if sizes else 0
+        measured_reference = (baseline_data or {}).get("summary", {}).get(op, {})
+        if baseline:
+            bp99 = measured_reference.get("p99_latency_s")
+            # A measured reference needs its own sample floor, the same as the
+            # vendor side.
+            enough_reference = measured_reference.get("count", 0) >= minimum
+        else:
+            bp99 = reference_p99(profile, op, median_bytes)
+            # The profile is a published figure, so there is no second sample
+            # set to qualify. Only the vendor's samples apply.
+            enough_reference = True
         limit = bp99 * multiplier if _number(bp99) and bp99 > 0 else None
         valid = (
-            not baseline_issues
+            # A supplied baseline must be comparable. A bundled profile has no
+            # comparability to establish, so "no baseline run supplied" must
+            # not invalidate the criterion it replaces.
+            (not baseline_issues if baseline else True)
             and limit is not None
             and raw["count"] >= minimum
-            and reference.get("count", 0) >= minimum
+            and enough_reference
         )
         state = (
             PASS
@@ -503,7 +541,17 @@ def build_report(run_dir, baseline=None, compliance=None, previous=None):
             if op == "query_wall_clock"
             else "Elapsed operation latency includes client retries. "
         )
-        explanation += f"p99 uses linear interpolation across all outcomes; requires {minimum} vendor and baseline samples."
+        explanation += (
+            "p99 uses linear interpolation across all outcomes; requires "
+            f"{minimum} vendor samples"
+            + (" and the same from the measured reference." if baseline else ".")
+        )
+        if not baseline and profile and limit is not None:
+            explanation += (
+                f" The limit comes from reference profile {profile['id']}"
+                f" v{profile['version']}, for a median payload of"
+                f" {median_bytes / (1024 * 1024):.2f} MiB."
+            )
         latency_check = add(
             op + "_p99",
             title + " p99",
@@ -513,7 +561,7 @@ def build_report(run_dir, baseline=None, compliance=None, previous=None):
             + (
                 f" = {limit * 1000:.1f} ms"
                 if limit is not None
-                else " (baseline unavailable)"
+                else " (no latency reference)"
             ),
             explanation,
             "Check sample counts and baseline comparability, then inspect concurrency and backend contention.",
@@ -573,6 +621,7 @@ def build_report(run_dir, baseline=None, compliance=None, previous=None):
                 **raw,
                 baseline_p99_s=bp99,
                 limit_p99_s=limit,
+                median_bytes=median_bytes,
                 # One row per operation carries all three of its verdicts, so
                 # the report can show a 9-row matrix instead of 27 separate
                 # criteria rows.
@@ -788,6 +837,18 @@ def build_report(run_dir, baseline=None, compliance=None, previous=None):
                 " failure in any of them is still a real failure.",
             }
         )
+    if profile:
+        headline_limits.append(
+            {
+                "title": "Latency is graded against published figures",
+                "detail": "No measured AWS run was supplied, so latency limits"
+                f" come from reference profile {profile['id']} v{profile['version']}."
+                " The profile states what AWS S3 delivers from an in-region"
+                " instance. It cannot account for this runner's own network"
+                " distance to the endpoint. Supply --baseline with a measured"
+                " AWS run for a side-by-side comparison.",
+            }
+        )
     headline_limits.append(
         {
             "title": "Error and latency figures are post-retry",
@@ -796,6 +857,17 @@ def build_report(run_dir, baseline=None, compliance=None, previous=None):
             " that fails often but recovers can still look clean here.",
         }
     )
+    if load.get("effective_config", {}).get("verify_tls") is False:
+        headline_limits.append(
+            {
+                "title": "The endpoint certificate was not verified",
+                "detail": "This run used --insecure-skip-tls-verify. The"
+                " measurements are still valid, because verification costs"
+                " nothing at run time. The connection was not authenticated"
+                " though, so this run does not show that clients can trust"
+                " this endpoint. Supply --ca-bundle for a trusted run.",
+            }
+        )
     headline_limits.append(
         {
             "title": "Results apply to the tested range only",
@@ -865,6 +937,10 @@ def build_report(run_dir, baseline=None, compliance=None, previous=None):
         "checks": checks,
         "measurements": measurements,
         "baseline": baseline_data,
+        "reference": {
+            "basis": "measured baseline" if baseline else "reference profile" if profile else "none",
+            "profile": describe(profile),
+        },
         "compatibility": compat,
         "consistency": consistency_summary,
         "sweeps": sweeps,
@@ -874,7 +950,7 @@ def build_report(run_dir, baseline=None, compliance=None, previous=None):
         "history": history,
         "limitations": [
             "Storage-layer simulation; not an end-to-end Quickwit functional or search benchmark.",
-            "Merged synthetic payloads are capped at 64 MiB; this does not demonstrate production-size merge throughput.",
+            "Merged synthetic payloads are capped at 160 MB to limit test cost. Real mature splits reach 8-10 GB, so production-size merge throughput is not demonstrated.",
             "Ingestion is expressed in MiB/s of successful original writes. Raw-log equivalents use the configured compression assumption.",
             "Read-after-write currently verifies returned byte length, not full payload equality; it is not a corruption test.",
             "Partial final windows are shown but excluded from sustained-rate and throttle gates.",

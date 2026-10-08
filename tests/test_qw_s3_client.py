@@ -182,3 +182,67 @@ def test_checksum_setting_decides_what_goes_on_the_wire(
     headers = _sent_checksum_headers(cfg)
     assert headers.get("x-amz-trailer") == expected_trailer
     assert ("content-md5" in headers) is (algorithm == "md5")
+
+
+def test_descriptor_limit_is_raised_when_the_system_allows_it(monkeypatch):
+    """
+    A concurrency sweep needs one socket per in-flight request. Raise the soft
+    limit automatically, so a default macOS shell can still run the sweep.
+    """
+    import resource
+
+    from src import qw_s3_client
+
+    state = {"soft": 256, "hard": resource.RLIM_INFINITY}
+
+    def getrlimit(which):
+        return state["soft"], state["hard"]
+
+    def setrlimit(which, limits):
+        state["soft"] = limits[0]
+
+    monkeypatch.setattr(resource, "getrlimit", getrlimit)
+    monkeypatch.setattr(resource, "setrlimit", setrlimit)
+    assert qw_s3_client.ensure_file_descriptors(2112) == 2112
+
+
+def test_an_unraisable_descriptor_limit_stops_the_sweep_with_guidance(monkeypatch):
+    """
+    Running anyway would exhaust the descriptor table part way through. The
+    sweep reads any error at a concurrency level as the backend failing, so a
+    runner limit would be recorded as a vendor fault.
+    """
+    import resource
+
+    from src import qw_s3_client
+
+    monkeypatch.setattr(resource, "getrlimit", lambda which: (256, 256))
+    monkeypatch.setattr(
+        resource, "setrlimit", lambda which, limits: (_ for _ in ()).throw(OSError())
+    )
+    with pytest.raises(ValueError) as error:
+        qw_s3_client.ensure_file_descriptors(2112)
+    message = str(error.value)
+    assert "256 open files" in message
+    assert "ulimit -n 2112" in message
+    assert "--levels" in message
+
+
+@pytest.mark.parametrize(
+    "verify,expected",
+    [(True, True), (False, False), ("/etc/ssl/private-ca.pem", "/etc/ssl/private-ca.pem")],
+)
+def test_tls_verification_setting_reaches_the_client(moto_s3, verify, expected):
+    """
+    On-premises appliances present certificates from a private authority. With
+    no way to supply one, a run can only use plain HTTP, which is not how the
+    endpoint serves production traffic.
+    """
+    cfg = QwS3Config(
+        endpoint_url=None, access_key="testing", secret_key="testing",
+        region="us-east-1", verify_tls=verify,
+    )
+    client = QwS3Client(cfg)
+    assert client._client.meta.endpoint_url is not None
+    # botocore stores the caller's choice on the endpoint's TLS context.
+    assert client._client._endpoint.http_session._verify == expected

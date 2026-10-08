@@ -34,6 +34,13 @@ python run_certification.py certify --tier 1TB --duration-min 30 \
 `certify` runs every stage in order, uses the flavor the compatibility probe
 recommends, and writes the report. Open the `report.html` it prints.
 
+**You do not need an AWS account.** Latency is graded against a bundled
+reference profile in `config/reference_profiles/`, which states what AWS S3
+delivers from an instance in the same region as its bucket. We publish it
+because we define the bar, and we grade ourselves against the same numbers.
+Supply `--with-aws-baseline` when you do have an account: a run measured next
+to yours is stronger evidence, and it wins over the profile.
+
 Prefer to see the output before running anything?
 
 ```bash

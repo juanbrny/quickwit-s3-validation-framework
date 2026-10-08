@@ -29,7 +29,7 @@ documents a `flavor` system, with options `digital_ocean`, `garage`, `gcs`,
 and `minio`. Each flavor works around a behavior gap in a specific provider.
 
 This framework adds its own flavors for vendors Quickwit does not cover:
-`seaweedfs` and `scality`. It also adds `aws`, which keeps every AWS default,
+`seaweedfs`, `scality` and `storagegrid`. It also adds `aws`, which keeps every AWS default,
 so a run against AWS S3 itself is named as such. Quickwit does not accept
 `seaweedfs` or `scality` as a `flavor` value. For those two, the report
 prints the explicit `storage.s3.*` block to ship instead.
@@ -39,10 +39,10 @@ a concrete, testable requirement.
 
 | Config knob | What it controls | Who needs it, per Quickwit's own docs |
 |---|---|---|
-| `force_path_style_access` | Path-style (`https://host/bucket/key`) vs. virtual-hosted (`https://bucket.host/key`) addressing | Ceph, MinIO, SeaweedFS, Scality |
+| `force_path_style_access` | Path-style (`https://host/bucket/key`) vs. virtual-hosted (`https://bucket.host/key`) addressing | Ceph, MinIO, SeaweedFS, Scality, StorageGRID |
 | `disable_multi_object_delete` | Falls back from bulk `DeleteObjects` (up to 1000 keys/request) to per-object `DeleteObject` | Google Cloud Storage (GCS), Digital Ocean |
 | `disable_multipart_upload` | Falls back to single-shot `PutObject` for large splits | GCS |
-| `checksum_algorithm` (`crc32c` \| `md5` \| `disabled`) | Whether upload integrity uses the AWS software development kit (SDK)'s Cyclic Redundancy Check (CRC32C) trailer, the legacy `Content-MD5` header, or no checksum | Providers that came before `x-amz-checksum-*` support need `md5` or `disabled`. This includes released versions of SeaweedFS and Scality |
+| `checksum_algorithm` (`crc32c` \| `md5` \| `disabled`) | Whether upload integrity uses the AWS software development kit (SDK)'s Cyclic Redundancy Check (CRC32C) trailer, the legacy `Content-MD5` header, or no checksum | Providers that came before `x-amz-checksum-*` support need `md5` or `disabled`. This includes released versions of SeaweedFS and Scality, and StorageGRID, which rejects the `x-amz-trailer` header outright |
 | Region override (for example, forced to the literal string `garage` or `minio`) | Some providers require a specific, or dummy, region string to pass Signature Version 4 (SigV4) validation | Garage, MinIO |
 | `endpoint` | Custom (non-AWS) endpoint URL | All non-AWS providers |
 | `QW_S3_MAX_CONCURRENCY` | Caps concurrent in-flight S3 requests | Adjustable, based on each provider's connection-handling capacity |
@@ -238,6 +238,9 @@ This has two direct consequences for the test suite:
 - Scality supported S3 operations, including Multi-Object Delete and multipart: `https://downloads.scality.com/artesca-ova/doc/reference/s3/index.html`
 - Scality CloudServer rejects trailing checksums with 400 BadRequest: `https://github.com/scality/cloudserver/issues/5553`
 - Scality endpoint addressing, and the DNS and certificate setup virtual-hosted style needs: `https://s3-server.readthedocs.io/en/latest/GETTING_STARTED.html`
+- NetApp StorageGRID PutObject, listing `Content-MD5` as supported and `x-amz-sdk-checksum-algorithm` and `x-amz-trailer` as unsupported: `https://docs.netapp.com/us-en/storagegrid/s3/put-object.html`
+- StorageGRID DeleteObjects and multipart support: `https://docs.netapp.com/us-en/storagegrid/s3/operations-on-objects.html`
+- StorageGRID S3 endpoint domain names, needed before virtual-hosted style works: `https://docs.netapp.com/us-en/storagegrid/admin/configuring-s3-api-endpoint-domain-names.html`
 - Quickwit AWS cost optimization guide (PUT/GET formulas, commit/merge defaults): `https://quickwit.io/docs/operating/aws-costs`
 - Quickwit metastore configuration docs (file-backed consistency/locking): `https://quickwit.io/docs/configuration/metastore-config`
 - Quickwit GitHub issue #12 (original file-backed metastore design rationale): `https://github.com/quickwit-oss/quickwit/issues/12`

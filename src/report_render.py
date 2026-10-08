@@ -43,6 +43,20 @@ def table(headers, rows):
     )
 
 
+def _reference_label(report):
+    """One line naming what the latency limits were compared against."""
+    reference = report.get("reference", {})
+    profile = reference.get("profile")
+    if reference.get("basis") == "measured baseline":
+        return "Measured AWS run supplied with --baseline"
+    if profile:
+        return (
+            f"Reference profile {profile['id']} v{profile['version']}"
+            f" ({profile.get('status', 'published')})"
+        )
+    return "None; latency criteria are inconclusive"
+
+
 def ratio_cell(value):
     """Headroom: how close the measurement sits to its own limit."""
     if not isinstance(value, (int, float)) or isinstance(value, bool):
@@ -250,6 +264,7 @@ def render_html(report, links=None):
         ("Requested region", run["identity"]["region"]),
         ("Actual flavor", report["flavor"]),
         ("Recommended flavor", report["recommended_flavor"]),
+        ("Latency reference", _reference_label(report)),
         ("Runner location", load.get("options", {}).get("runner_location")),
     ]
     parts.append(
@@ -364,6 +379,7 @@ def render_html(report, links=None):
                 [
                     "Operation",
                     "Samples",
+                    "Median payload",
                     "p99 ms",
                     "Limit ms",
                     "Headroom",
@@ -375,6 +391,7 @@ def render_html(report, links=None):
                     [
                         esc(m["name"]),
                         str(m["count"]),
+                        fmt(m.get("median_bytes", 0) / 1048576, 3) + " MiB",
                         fmt(m["p99_latency_s"] * 1000),
                         fmt(
                             m["limit_p99_s"] * 1000
@@ -604,8 +621,16 @@ def render_html(report, links=None):
     yaml_block = attempts.get(rec, {}).get("yaml")
     if yaml_block:
         note = flavor_note(rec)
+        same = report["compatibility"].get("equivalent_flavors") or []
         parts.append(
             f"<h3>Recommended Quickwit configuration · {esc(rec)}</h3>"
+            + (
+                '<p class="muted">These settings also carry the names '
+                + esc(", ".join(same))
+                + ". The configuration below is the same for all of them.</p>"
+                if same
+                else ""
+            )
             + (f'<p class="muted">{esc(note)}</p>' if note else "")
             + f"<pre>{esc(yaml_block)}</pre>"
         )
@@ -683,6 +708,19 @@ def render_html(report, links=None):
             )
             + "</ul>"
         )
+    reference = report.get("reference", {})
+    parts.append(
+        f'<h3>Latency reference</h3><p>{esc(_reference_label(report))}</p>'
+        + (
+            "<p>This is a published figure, not a run measured next to yours."
+            " It states what AWS S3 delivers from an instance in the same"
+            " region as its bucket. Supply --baseline with a measured AWS run"
+            " for a side-by-side comparison.</p>"
+            + pretty(reference.get("profile"))
+            if reference.get("basis") == "reference profile"
+            else ""
+        )
+    )
     parts.append(
         "<details><summary>AWS reference metadata and comparability</summary>"
         + pretty(report["baseline"])
@@ -714,6 +752,8 @@ def render_markdown(report):
         f"Run: {report['run']['run_id']} · Generated: {report['generated_at']}",
         "",
         f"Flavor used: {report['flavor']}; recommended: {report['recommended_flavor']}",
+        "",
+        f"Latency reference: {_reference_label(report)}",
         "",
     ]
     for item in report.get("headline_limits", []):
@@ -769,8 +809,8 @@ def render_markdown(report):
         lines += [
             "## Operations matrix",
             "",
-            "| Operation | Samples | p99 ms | Limit ms | Headroom | Latency | Errors | Throttling |",
-            "|---|---|---|---|---|---|---|---|",
+            "| Operation | Samples | Median payload | p99 ms | Limit ms | Headroom | Latency | Errors | Throttling |",
+            "|---|---|---|---|---|---|---|---|---|",
         ]
         for m in report["measurements"]:
             lines.append(
@@ -779,6 +819,7 @@ def render_markdown(report):
                     [
                         cell(m["name"]),
                         str(m["count"]),
+                        fmt(m.get("median_bytes", 0) / 1048576, 3) + " MiB",
                         fmt(m["p99_latency_s"] * 1000),
                         fmt(
                             m["limit_p99_s"] * 1000

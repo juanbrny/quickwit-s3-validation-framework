@@ -77,6 +77,26 @@ FLAVOR_PRESETS = {
     "scality": dict(force_path_style=True, disable_multi_object_delete=False,
                     disable_multipart_upload=False, checksum_algorithm="md5",
                     region_override=None),
+    # NetApp StorageGRID, with the evidence for each knob (docs 12.0):
+    #
+    # * Bulk delete stays on. DeleteObjects is supported, and "multiple
+    #   objects can be deleted in the same request message".
+    # * Multipart stays on. CreateMultipartUpload, UploadPart,
+    #   CompleteMultipartUpload and UploadPartCopy are all supported.
+    # * Path style is on. Virtual-hosted style needs S3 endpoint domain names
+    #   configured in the Grid Manager, plus matching DNS records: "If you
+    #   don't add S3 endpoint domain names and the list is empty, support for
+    #   S3 virtual-hosted-style requests is disabled."
+    # * MD5, not CRC32C. The PutObject page lists `Content-MD5` as supported,
+    #   and lists both `x-amz-sdk-checksum-algorithm` and `x-amz-trailer` as
+    #   unsupported. Those two are exactly what boto3 sends for CRC32C, so the
+    #   default checksum path cannot work here. See boto_config(), which stops
+    #   botocore adding a trailer of its own.
+    # * No region override. The grid administrator sets the region, and
+    #   us-east-1 is the documented example, so the run keeps --region.
+    "storagegrid": dict(force_path_style=True, disable_multi_object_delete=False,
+                        disable_multipart_upload=False, checksum_algorithm="md5",
+                        region_override=None),
     "digital_ocean": dict(force_path_style=True, disable_multi_object_delete=True,
                            disable_multipart_upload=False, checksum_algorithm="crc32c",
                            region_override=None),
@@ -96,7 +116,22 @@ DEFAULT_FLAVORS = frozenset({"none", "aws"})
 # deviation first, so the probe recommends the mildest configuration that
 # works. "aws" is absent on purpose: it repeats "none" exactly.
 AUTO_PROBE_ORDER = ["none", "minio", "garage", "seaweedfs", "scality",
-                    "digital_ocean", "gcs"]
+                    "storagegrid", "digital_ocean", "gcs"]
+
+
+def equivalent_flavors(flavor: str) -> list:
+    """Every flavor name that selects the same settings as this one.
+
+    SeaweedFS, Scality and StorageGRID need the same four settings today. A
+    StorageGRID operator should not have to ship a configuration labelled
+    `seaweedfs`, so the report names all of them.
+    """
+    signature = flavor_signature(flavor)
+    return [
+        name
+        for name in FLAVOR_PRESETS
+        if name != flavor and flavor_signature(name) == signature
+    ]
 
 
 def flavor_signature(flavor: str) -> tuple:
@@ -148,10 +183,15 @@ class QwS3Config:
     checksum_algorithm: str = "crc32c"   # crc32c | md5 | disabled
     region_override: Optional[str] = None
     max_concurrency: int = 50
+    # True verifies against the system trust store. A path verifies against a
+    # private certificate authority (CA) bundle, which on-premises appliances
+    # usually need. False skips verification.
+    verify_tls: object = True
 
     @classmethod
     def from_flavor(cls, flavor: str, endpoint_url, access_key, secret_key,
-                     region="us-east-1", max_concurrency=50) -> "QwS3Config":
+                     region="us-east-1", max_concurrency=50,
+                     verify_tls=True) -> "QwS3Config":
         preset = FLAVOR_PRESETS[flavor]
         return cls(
             endpoint_url=endpoint_url, access_key=access_key, secret_key=secret_key,
@@ -162,6 +202,7 @@ class QwS3Config:
             checksum_algorithm=preset["checksum_algorithm"],
             region_override=preset["region_override"],
             max_concurrency=max_concurrency,
+            verify_tls=verify_tls,
         )
 
     def as_quickwit_yaml(self) -> str:
@@ -195,6 +236,7 @@ class QwS3Client:
             aws_secret_access_key=cfg.secret_key,
             region_name=cfg.region,
             config=boto_cfg,
+            verify=cfg.verify_tls,
         )
 
     # ---- bucket lifecycle -------------------------------------------------
@@ -335,6 +377,41 @@ class QwS3Client:
 
     def metastore_write(self, bucket: str, key: str, data: bytes) -> dict:
         return self.put_split(bucket, key, data)
+
+
+def ensure_file_descriptors(required: int) -> int:
+    """Raise this process's open-file limit to cover a concurrency sweep.
+
+    Each in-flight request needs its own socket, and a socket needs a file
+    descriptor. macOS ships a low per-shell default, so a 1024-way sweep hits
+    "Too many open files" before it reaches the endpoint.
+
+    That failure belongs to the runner, not to the backend. The sweep treats
+    any error at a concurrency level as the point where the backend stops
+    coping, so an exhausted descriptor table would be recorded as a vendor
+    fault. Raise the limit where the system allows it, and stop before the
+    sweep starts where it does not.
+    """
+    try:
+        import resource
+    except ImportError:  # not a POSIX platform
+        return required
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft < required:
+        target = required if hard == resource.RLIM_INFINITY else min(required, hard)
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        except (ValueError, OSError):
+            pass
+        soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    if soft < required:
+        raise ValueError(
+            f"This machine allows {soft} open files per process. The sweep needs"
+            f" about {required}, one socket per concurrent request. Raise the"
+            f" limit with `ulimit -n {required}` in this shell, or lower the top"
+            " concurrency with --levels."
+        )
+    return soft
 
 
 def boto_config(cfg: "QwS3Config", max_pool_connections: int) -> BotoConfig:

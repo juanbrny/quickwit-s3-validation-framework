@@ -512,11 +512,28 @@ def test_certify_takes_connection_settings_from_the_environment(
     assert read_json(run / "manifest.json")["identity"]["bucket"] == "qw-certify-env"
 
 
-def test_missing_connection_settings_name_their_environment_variable(monkeypatch):
+def test_missing_connection_settings_name_their_environment_variable(monkeypatch, capsys):
     for name in CONNECTION_ENV:
         monkeypatch.delenv(name, raising=False)
     with pytest.raises(SystemExit):
         main(["load", "--tier", "1TB"])
+    assert "$QW_S3_ACCESS_KEY" in capsys.readouterr().err
+
+
+def test_an_empty_shell_variable_is_reported_as_empty(monkeypatch, capsys):
+    """
+    An unset shell variable expands to an empty argument, so `--access-key
+    "$AK"` looks present while carrying nothing. Saying "missing" there sends
+    the operator looking for a flag they did pass.
+    """
+    for name in CONNECTION_ENV:
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(SystemExit):
+        main(["load", "--tier", "1TB", "--endpoint", "https://s3.vendor.test",
+              "--bucket", "b", "--access-key", "", "--secret-key", "secret"])
+    error = capsys.readouterr().err
+    assert "--access-key is empty" in error
+    assert "--secret-key" not in error
 
 
 def test_certify_stops_when_no_flavor_works(moto_server_endpoint, tmp_path, monkeypatch):
@@ -700,3 +717,53 @@ def test_baseline_credentials_are_checked_before_the_soak(tmp_path, monkeypatch)
               "--access-key", "a", "--secret-key", "s", "--tier", "1TB",
               "--run-dir", str(run), "--with-aws-baseline"])
     assert not run.exists()
+
+
+def test_a_vendor_without_aws_still_gets_graded_latency(bundle):
+    """
+    The point of the bundled profile: no AWS account, still a real verdict.
+    Without it, every latency criterion would read INCONCLUSIVE and the report
+    could not answer "is it as fast as AWS S3".
+    """
+    report = build_report(bundle)  # no --baseline
+    assert report["reference"]["basis"] == "reference profile"
+    assert report["reference"]["profile"]["id"] == "aws-s3-ec2-same-region"
+    latency = [c for c in report["checks"] if c["id"].endswith("_p99")]
+    assert latency and all(c["status"] in ("PASS", "FAIL") for c in latency)
+    assert indexed(report)["baseline"]["status"] == "PASS"
+    # The report must say the bar is published, not measured next to this run.
+    titles = [item["title"] for item in report["headline_limits"]]
+    assert "Latency is graded against published figures" in titles
+    assert "reference profile" in render_html(report)
+
+
+def test_a_measured_baseline_overrides_the_bundled_profile(bundle, tmp_path):
+    baseline = make_bundle(tmp_path / "aws", True)
+    report = build_report(bundle, baseline)
+    assert report["reference"]["basis"] == "measured baseline"
+    assert report["reference"]["profile"] is None
+    titles = [item["title"] for item in report["headline_limits"]]
+    assert "Latency is graded against published figures" not in titles
+
+
+def test_reference_none_keeps_latency_inconclusive(bundle):
+    """An operator who rejects the published bar can still opt out."""
+    report = build_report(bundle, reference="none")
+    assert report["reference"]["basis"] == "none"
+    latency = [c for c in report["checks"] if c["id"].endswith("_p99")]
+    assert all(c["status"] == "INCONCLUSIVE" for c in latency)
+    assert indexed(report)["baseline"]["status"] == "INCONCLUSIVE"
+
+
+def test_profile_limits_follow_the_recorded_payload_size(bundle):
+    """
+    The profile holds two numbers, not a table. Each operation's limit comes
+    from its own median payload, so one profile covers every tier.
+    """
+    report = build_report(bundle)
+    by_op = {m["op"]: m for m in report["measurements"]}
+    small, large = by_op["get_term_or_field"], by_op["put_object"]
+    assert large["median_bytes"] > small["median_bytes"]
+    assert large["limit_p99_s"] > small["limit_p99_s"]
+    for m in report["measurements"]:
+        assert m["median_bytes"] >= 0

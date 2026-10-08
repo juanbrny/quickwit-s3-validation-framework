@@ -22,6 +22,15 @@ per-operation criteria are rendered once as the operations matrix, not as rows
 in the criteria tables. `headline_limits` states the certification ceiling in
 one place; do not restate it in `limitations` or in the docs.
 
+Latency reference: `src/reference_profile.py` plus
+`config/reference_profiles/*.yaml`. A profile holds `first_byte_p99_s` and
+`per_stream_mb_s`, and the per-operation limit follows the recorded median
+payload, with multipart parts treated as concurrent streams. A measured
+`--baseline` wins when supplied; otherwise the default profile applies, so a
+vendor with no AWS account still gets a graded verdict. `--reference none`
+restores the inconclusive behavior. Never add a per-operation latency table;
+object sizes change per tier, and the two-number model already covers them.
+
 Missing evidence is NOT RUN or INCONCLUSIVE, never PASS. The synchronous
 simulator cannot measure merge backlog, so `best_possible_verdict` is
 INCONCLUSIVE and full certification stays blocked.
@@ -105,7 +114,8 @@ simulation or probe, and writes raw JSON (JavaScript Object Notation) to
   `disable_multipart_upload`, `checksum_algorithm`, region override).
   `FLAVOR_PRESETS` transcribes the upstream flavors (minio, garage,
   digital_ocean, gcs) from Quickwit's `storage-config.md`. It adds local
-  flavors Quickwit does not cover (seaweedfs, scality) and `aws`, which
+  flavors Quickwit does not cover (seaweedfs, scality, storagegrid) and
+  `aws`, which
   keeps every AWS default so AWS S3 can be the endpoint under test, not
   only the baseline. `UPSTREAM_FLAVORS`, `DEFAULT_FLAVORS` and
   `flavor_note()` keep those groups apart: only `none` and `aws` certify

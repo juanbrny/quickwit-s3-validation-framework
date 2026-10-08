@@ -150,3 +150,49 @@ def test_flavors_with_identical_settings_are_probed_once(moto_s3, monkeypatch):
         result["attempts"]["scality"]["results"]
         == result["attempts"]["seaweedfs"]["results"]
     )
+
+
+def test_storagegrid_flavor_avoids_the_headers_storagegrid_rejects(moto_s3):
+    """
+    NetApp StorageGRID's PutObject page lists `x-amz-sdk-checksum-algorithm`
+    and `x-amz-trailer` as unsupported request headers, and lists
+    `Content-MD5` as supported. Those two headers are exactly what boto3
+    sends for CRC32C, so the default checksum path cannot work there.
+    """
+    cfg = QwS3Config.from_flavor(
+        "storagegrid", endpoint_url=None, access_key="testing", secret_key="testing",
+    )
+    assert cfg.checksum_algorithm == "md5"
+    assert cfg.force_path_style is True        # virtual-hosted style needs DNS setup
+    assert cfg.disable_multi_object_delete is False   # DeleteObjects is supported
+    assert cfg.disable_multipart_upload is False      # multipart is supported
+    assert cfg.region_override is None         # the grid administrator sets the region
+
+    client = QwS3Client(cfg)
+    captured = {}
+    client._client.meta.events.register(
+        "before-send.s3.PutObject",
+        lambda request, **kw: captured.update(
+            {k.lower(): v for k, v in request.headers.items()}
+        ),
+    )
+    client.ensure_bucket(TEST_BUCKET)
+    assert client.put_split(TEST_BUCKET, "compat/storagegrid", b"payload")["ok"]
+    assert "x-amz-trailer" not in captured
+    assert "x-amz-sdk-checksum-algorithm" not in captured
+    assert "content-md5" in captured
+
+
+def test_vendors_that_share_settings_are_all_named(moto_s3, monkeypatch):
+    """
+    SeaweedFS, Scality and StorageGRID need the same four settings. A
+    StorageGRID operator should not be handed a configuration labelled
+    `seaweedfs`, so the probe reports every equivalent name.
+    """
+    monkeypatch.setattr(compat_checks, "AUTO_PROBE_ORDER", ["seaweedfs"])
+    result = compat_checks.probe_flavor(
+        endpoint_url=None, access_key="testing", secret_key="testing",
+        bucket=TEST_BUCKET, region="us-east-1",
+    )
+    assert result["recommended_flavor"] == "seaweedfs"
+    assert set(result["equivalent_flavors"]) == {"scality", "storagegrid"}

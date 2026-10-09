@@ -1,3 +1,4 @@
+.DS_Store
 enginesrc/
 venv/
 __pycache__/

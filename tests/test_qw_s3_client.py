@@ -295,7 +295,7 @@ def test_running_out_of_files_is_blamed_on_the_machine(moto_s3, monkeypatch):
 
 def test_the_workload_step_asks_for_enough_open_files():
     """Four search workers can need 620 sockets at once, far above macOS's 256."""
-    from run_certification import load_file_descriptors
+    from run_validation import load_file_descriptors
     from src.workload_model import load_config
 
     assert load_file_descriptors(load_config()) >= 4 * 155 + 256

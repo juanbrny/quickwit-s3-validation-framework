@@ -9,4 +9,4 @@ boto3==1.40.61
 botocore==1.40.61
 awscrt==0.27.6   # must match botocore's declared crt extra for this botocore version, or checksum signing crashes intermittently under thread concurrency
 PyYAML>=6.0
-aioboto3==15.5.0  # async engine for concurrency_fanout_async.py (run_certification.py fanout --engine asyncio)
+aioboto3==15.5.0  # async engine for concurrency_fanout_async.py (run_validation.py fanout --engine asyncio)

@@ -10,7 +10,7 @@ serialized). These tests only confirm the sweep executes correctly at every
 concurrency level and produces well-formed results -- they deliberately do
 NOT assert anything about efficiency thresholds or degrades_at_concurrency,
 since those numbers aren't meaningful against moto. Detecting a real
-vendor's concurrency ceiling is what `run_certification.py fanout` against
+vendor's concurrency ceiling is what `run_validation.py fanout` against
 a real endpoint is for.
 
 Uses the moto_server_endpoint fixture (a real local HTTP server), not the

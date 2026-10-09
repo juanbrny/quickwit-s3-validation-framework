@@ -36,7 +36,7 @@ tiers:
     query_qps: 500
 
 # Tiers beyond the commercial range covered by `tiers` above. Real, but rare,
-# customers ingest around 10PB/day. This tier is NOT in `run_certification.py
+# customers ingest around 10PB/day. This tier is NOT in `run_validation.py
 # load`'s default --tier choices and must never run silently: at this volume
 # a soak test moves petabytes of data, which can run up a large, real cloud
 # bill fast, and any left-behind objects/buckets become a hidden ongoing

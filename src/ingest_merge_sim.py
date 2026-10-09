@@ -181,7 +181,7 @@ def run_ingest_merge_sim(client: QwS3Client, bucket: str, prefix: str, op_mix: O
     If `block=False`, returns the list of started threads immediately so the
     caller can run this concurrently with run_query_sim() and
     run_consistency_probes() against the shared `registry` and `stop_event`
-    -- this is how `run_certification.py load` actually drives all three at
+    -- this is how `run_validation.py load` actually drives all three at
     once, matching a real deployment where indexers, mergers, and searchers
     hit the bucket simultaneously (see docs/background/02_test_methodology.md Layer 3).
     """

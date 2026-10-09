@@ -78,7 +78,7 @@ def provenance():
         except (OSError, ValueError, subprocess.CalledProcessError):
             pass
     # Include source fingerprints even for uncommitted or downloaded code.
-    source_files = [ROOT / "run_certification.py", *sorted((ROOT / "src").glob("*.py"))]
+    source_files = [ROOT / "run_validation.py", *sorted((ROOT / "src").glob("*.py"))]
     source_hash = hashlib.sha256(
         "".join(digest(p) for p in source_files).encode()
     ).hexdigest()

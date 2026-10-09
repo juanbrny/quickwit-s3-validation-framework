@@ -108,7 +108,7 @@ def compare_to_baseline(vendor_summary: dict, baseline_summary: Optional[dict],
 def render_markdown_report(tier: str, endpoint: str, compat_result: dict,
                             op_verdicts: dict, consistency_result: dict,
                             out_path: Path, fanout_summary: Optional[dict] = None):
-    lines = [f"# Quickwit S3 Compatibility & Performance Report",
+    lines = [f"# BYOC Logs S3 Compatibility & Performance Report",
              f"", f"**Tier:** {tier}  ", f"**Endpoint under test:** {endpoint}  ", ""]
 
     lines.append("## Layer 2 — Compatibility knobs")
@@ -190,16 +190,16 @@ def render_markdown_report(tier: str, endpoint: str, compat_result: dict,
 
     lines.append("## Overall\n")
     # Legacy input has no run identity, complete gate coverage, or configuration
-    # provenance. Only the versioned report pipeline may issue certification.
+    # provenance. Only the versioned report pipeline may issue a result.
     final = False
     lines.append("Legacy diagnostic only: run metadata and required evidence are unavailable. "
                  "Use `report --run-dir` for the complete evaluated report.")
     if final and rec == "none":
-        lines.append(f"### CERTIFIED for {tier} (default configuration)")
+        lines.append(f"### PASS for {tier} (default settings)")
     elif final:
-        lines.append(f"### CERTIFIED WITH DEVIATION for {tier} (requires `flavor: {rec}`)")
+        lines.append(f"### PASS for {tier} (needs `flavor: {rec}`)")
     else:
-        lines.append(f"### NOT CERTIFIED at {tier}")
+        lines.append(f"### Not a PASS at {tier}")
         failing = [op for op, v in op_verdicts.items() if not v["passed"]]
         if failing:
             lines.append(f"\nFirst metrics to investigate: {', '.join(failing)}")
@@ -236,7 +236,7 @@ def render_compat_markdown(compat_result: dict, out_path: Path):
         "",
         "One row per check, one column per flavor attempted. "
         "See docs/background/01_s3_interaction_analysis.md section 2 for what each check "
-        "corresponds to in Quickwit's own storage config.",
+        "corresponds to in the storage settings.",
         "",
     ]
 
@@ -294,7 +294,7 @@ def render_compat_markdown(compat_result: dict, out_path: Path):
         lines.append(
             "\nThis is a pass/fail gate, not a performance result. Passing it means it's "
             "worth running the throughput-tier load tests (Layer 3) -- not that the "
-            "endpoint is certified at any particular ingestion tier. See "
+            "endpoint passes at any particular ingestion tier. See "
             "docs/background/02_test_methodology.md."
         )
     else:

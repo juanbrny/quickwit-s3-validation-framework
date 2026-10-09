@@ -17,13 +17,33 @@ PASS, FAIL, NOT_RUN, INCONCLUSIVE = "PASS", "FAIL", "NOT RUN", "INCONCLUSIVE"
 # The four questions a reader brings to the report. Every criterion belongs to
 # exactly one of them, so the report can show four roll-up answers instead of
 # one flat list of several dozen equally weighted rows.
+# What this synthetic tool cannot test. These belong to the later stage: the
+# performance tests run together with the BYOC modules. They are listed in the
+# report and in docs/what_this_measures.md, and they never hold a result back.
+LATER_STAGE = [
+    {"title": "Merge backlog",
+     "detail": "Whether merges keep up with incoming data over hours and days. That"
+               " needs BYOC's own merge scheduler. This tool runs simple merges"
+               " inside its upload workers."},
+    {"title": "Full-size merges",
+     "detail": "Real merged files reach 8 to 10 GB. To limit cost, this tool merges"
+               " into files of at most 160 MB. That still tests multipart uploads,"
+               " but not transfers that large."},
+    {"title": "Indexing and search results",
+     "detail": "Whether BYOC indexes documents and returns the right results. This"
+               " tool tests storage only."},
+    {"title": "Whole search time",
+     "detail": "This tool times the storage reads of a search, not a complete BYOC"
+               " search."},
+]
+
 # The five questions in docs/what_this_measures.md, in the same order and the
 # same words. The report and that page must never drift apart. A sixth
 # section covers whether the run itself can be trusted. Its checks never
 # decide the result; they make an affected result inconclusive instead.
 QUESTIONS = [
-    ("compatibility", "Does the storage speak S3 the way Quickwit needs?",
-     "The five things Quickwit needs from an S3 interface."),
+    ("compatibility", "Does the storage speak S3 the way BYOC needs?",
+     "The five things BYOC needs from an S3 interface."),
     ("concurrency", "Does the storage handle many requests at the same time?",
      "Whether a group of requests sent together is served together."),
     ("keeps_up", "Can the storage keep up?",
@@ -53,7 +73,7 @@ def roll_up(members, missing_expected=False):
     worst = next((s for s in STATUS_ORDER if s in states), NOT_RUN)
     # A failure always shows, even when other operations are missing. An
     # earlier version returned NOT RUN whenever an operation was missing,
-    # which hid real failures and turned NOT CERTIFIED into INCONCLUSIVE.
+    # which hid real failures and turned FAIL into INCONCLUSIVE.
     if worst == FAIL:
         return FAIL
     # Something was measured, but not everything. That is INCONCLUSIVE, by the
@@ -202,6 +222,39 @@ def level_speedup(row):
     return None
 
 
+# Below this many samples, nothing about the slowest requests can be said.
+SMALL_SAMPLE_FLOOR = 3
+
+
+def latency_result(count, p99, p50, slowest, limit, minimum):
+    """Judge one operation's response time, even when it ran only a few times.
+
+    With `minimum` samples or more, the p99 decides. Some operations are
+    rare: at 100 GB/day a merge runs about every 10 minutes, so 100 merge
+    samples would take about 17 hours. Waiting for them would stop such a run
+    from ever passing. With fewer samples, only what the data proves decides:
+
+    * PASS if even the slowest sample is within the limit. Every request we
+      saw met it. This is weaker evidence than 100 samples, and the result
+      says which rule decided.
+    * FAIL if the median is over the limit. Then the p99 is over it too.
+    * INCONCLUSIVE in between, and below SMALL_SAMPLE_FLOOR samples.
+
+    Returns the status and a short note for the report.
+    """
+    if limit is None:
+        return INCONCLUSIVE, ""
+    if count >= minimum:
+        return (PASS if p99 <= limit else FAIL), ""
+    if count < SMALL_SAMPLE_FLOOR or not _number(slowest) or not _number(p50):
+        return INCONCLUSIVE, f" (needs {minimum})"
+    if slowest <= limit:
+        return PASS, f" (few samples: all {count} within the limit)"
+    if p50 > limit:
+        return FAIL, f" (few samples: the median is over the limit)"
+    return INCONCLUSIVE, f" (few samples: some over the limit, needs {minimum})"
+
+
 def limit_ratio(observed, limit, at_most=True):
     """How close one measurement sits to its own limit. At most 1.0 passes.
 
@@ -242,12 +295,19 @@ def group_status(checks, group):
 
 
 def overall(checks, flavor):
+    """PASS, FAIL or INCONCLUSIVE: the same words every check uses.
+
+    This is a synthetic test, not a formal certification. A run passes when
+    every deciding check passes. Whether BYOC needs special storage settings
+    is reported beside the result, not folded into it. Anything this tool
+    cannot test is listed in LATER_STAGE and never holds a result back.
+    """
     required = [c for c in checks if c["required"]]
     if any(c["status"] == FAIL for c in required):
-        return "NOT CERTIFIED"
+        return FAIL
     if not required or flavor is None or any(c["status"] != PASS for c in required):
         return INCONCLUSIVE
-    return "CERTIFIED" if flavor in DEFAULT_FLAVORS else "CERTIFIED WITH DEVIATION"
+    return PASS
 
 
 def _number(value):
@@ -507,7 +567,7 @@ def build_report(
     rec = compat.get("recommended_flavor")
     # Grade the settings the run actually used. Usually that is the
     # recommendation, but an operator may choose other settings with
-    # `certify --flavor`. Grading the recommendation instead would certify
+    # `validate --flavor`. Grading the recommendation instead would pass
     # settings nobody measured.
     used = flavor or rec
     attempts = compat.get("attempts", {})
@@ -559,7 +619,7 @@ def build_report(
         compat_status,
         compat_seen,
         "All compatibility checks pass",
-        "Tests the S3 behavior exercised by Quickwit's storage settings.",
+        "Tests the S3 behavior that BYOC's storage settings depend on.",
         "Inspect the flavor comparison and failing check details.",
         group="compatibility",
         source={"command": "compat", "evidence": "compat.json"},
@@ -579,7 +639,7 @@ def build_report(
         PASS if matching else INCONCLUSIVE,
         f"Used: {flavor_label(flavor)}; recommended: {flavor_label(rec)}",
         "All three measured steps used the same settings, and those settings passed compatibility",
-        "A passing result under one configuration does not certify a different configuration.",
+        "A passing result under one configuration says nothing about a different configuration.",
         "Run again with one set of settings that passes compatibility, in a new run directory.",
         group="trust",
         required=False,
@@ -657,17 +717,6 @@ def build_report(
             },
             ratio=limit_ratio(observed, requirement, at_most=False),
         )
-    add(
-        "merge_backlog",
-        "Merge backlog",
-        NOT_RUN,
-        "No independent merge queue is measured",
-        "Flat or decreasing backlog under sustained offered ingestion",
-        "Merges run synchronously inside indexer workers. This simulation cannot establish the documented merge-backlog check.",
-        "Instrument an independently scheduled merger before claiming full tier certification.",
-        group="keeps_up",
-        source={"command": "load", "evidence": "not measured yet"},
-    )
 
     expected_groups = [
         ("put_object", "multipart_upload"),
@@ -720,31 +769,29 @@ def build_report(
             # set to qualify. Only the vendor's samples apply.
             enough_reference = True
         limit = bp99 * multiplier if _number(bp99) and bp99 > 0 else None
-        valid = (
+        comparable = (
             # A supplied baseline must be comparable. A bundled profile has no
             # comparability to establish, so "no baseline run supplied" must
             # not invalidate the criterion it replaces.
             (not baseline_issues if baseline else True)
             and limit is not None
-            and raw["count"] >= minimum
             and enough_reference
         )
-        state = (
-            PASS
-            if valid and raw["p99_latency_s"] <= limit
-            else FAIL
-            if valid
-            else INCONCLUSIVE
+        latencies = [r["latency_s"] for r in relevant]
+        state, rule = latency_result(
+            raw["count"], raw["p99_latency_s"], raw["p50_latency_s"],
+            max(latencies, default=None), limit if comparable else None, minimum,
         )
         explanation = (
-            "Storage-read fan-out completion under mixed load; this is not end-to-end Quickwit search latency. "
+            "Storage-read fan-out completion under mixed load; this is not end-to-end BYOC search latency. "
             if op == "query_wall_clock"
             else "Elapsed operation latency includes client retries. "
         )
         explanation += (
-            "p99 uses linear interpolation across all outcomes; requires "
-            f"{minimum} vendor samples"
-            + (" and the same from the measured reference." if baseline else ".")
+            f"With {minimum} samples or more, the p99 decides"
+            + (", and the measured reference needs as many." if baseline else ".")
+            + f" With fewer, the slowest sample and the median decide: PASS if every"
+            " sample is within the limit, FAIL if the median is over it."
         )
         if not baseline and profile and limit is not None:
             explanation += (
@@ -756,8 +803,7 @@ def build_report(
             op + "_p99",
             title + " p99",
             state,
-            f"{raw['p99_latency_s'] * 1000:.1f} ms; n={raw['count']}"
-            + (f" (needs {minimum})" if raw["count"] < minimum else ""),
+            f"{raw['p99_latency_s'] * 1000:.1f} ms; n={raw['count']}" + rule,
             f"≤ {multiplier:g}× AWS"
             + (
                 f" = {limit * 1000:.1f} ms"
@@ -980,7 +1026,7 @@ def build_report(
         if probes
         else "No visibility checks recorded",
         "A new object is readable, listed and gone when it should be",
-        "After a write, a list or a delete, we immediately look again. Quickwit"
+        "After a write, a list or a delete, we immediately look again. BYOC"
         " assumes the change is already visible.",
         "Open the three visibility checks below for the failing one.",
         group="correctness",
@@ -1175,17 +1221,6 @@ def build_report(
     # be scattered through the criteria text, where the practical consequence
     # was easy to miss.
     headline_limits = []
-    if indexed["merge_backlog"]["status"] == NOT_RUN:
-        headline_limits.append(
-            {
-                "title": "Full tier certification is not available yet",
-                "detail": "Merge backlog has no measurement in this simulator, and"
-                " it is a required check. The overall result can therefore"
-                " reach INCONCLUSIVE at best, never CERTIFIED, however well the"
-                " endpoint performs. Every other check is measured, and a"
-                " failure in any of them is still a real failure.",
-            }
-        )
     ran = [s for s in ("compat", "fanout", "put-fanout", "load") if s in stages]
     if len(ran) < 4:
         headline_limits.insert(
@@ -1197,7 +1232,7 @@ def build_report(
                 + ". Everything the missing stages would measure reads NOT RUN"
                 " below, which is not a pass and not a failure. Run the"
                 " remaining stages into the same run directory, or use"
-                " `certify` to run all of them in order.",
+                " `validate` to run all of them in order.",
             },
         )
     if paused_s > PAUSE_THRESHOLD_S:
@@ -1249,16 +1284,17 @@ def build_report(
                     f" and this run uploaded {uploads}, so no merge and no merge"
                     " delete happened"
                 )
+            # Only operations the small-sample rule could not judge either.
+            undecided = {c["id"] for c in checks if c["status"] == INCONCLUSIVE}
             thin = [
                 OP_NAMES.get(op, op)
                 for op, raw in summary.items()
-                if raw["count"] < minimum
+                if raw["count"] < minimum and op + "_p99" in undecided
             ]
             if thin:
                 reasons.append(
-                    f"each operation needs {minimum} samples, and "
-                    + ", ".join(thin)
-                    + " got fewer"
+                    ", ".join(thin)
+                    + " had too few samples to judge"
                 )
             # A short run that still answered every check needs no warning.
             if reasons:
@@ -1395,10 +1431,8 @@ def build_report(
         "flavor": flavor,
         "recommended_flavor": rec,
         "verdict": verdict,
-        "best_possible_verdict": INCONCLUSIVE
-        if indexed["merge_backlog"]["status"] == NOT_RUN
-        else "CERTIFIED",
         "headline_limits": headline_limits,
+        "later_stage": LATER_STAGE,
         "groups": [
             {
                 "id": key,
@@ -1439,8 +1473,6 @@ def build_report(
         "external_compliance": external,
         "history": history,
         "limitations": [
-            "Storage-layer simulation; not an end-to-end Quickwit functional or search benchmark.",
-            "Merged synthetic payloads are capped at 160 MB to limit test cost. Real mature splits reach 8-10 GB, so production-size merge throughput is not demonstrated.",
             "Ingestion is expressed in MiB/s of successful original writes. Raw-log equivalents use the configured compression assumption.",
             "Read-after-write currently verifies returned byte length, not full payload equality; it is not a corruption test.",
             "A partial last window is shown, but does not count toward the rate and throttling checks.",

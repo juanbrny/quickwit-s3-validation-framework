@@ -165,7 +165,7 @@ def flavor_label(flavor: Optional[str]) -> str:
     if flavor is None:
         return "not recorded"
     if flavor == "none":
-        return "Quickwit defaults (no flavor setting)"
+        return "BYOC defaults (no flavor setting)"
     if flavor == "aws":
         return "aws (AWS S3 defaults)"
     return flavor
@@ -176,7 +176,7 @@ def flavor_note(flavor: Optional[str]) -> Optional[str]:
     if flavor is None or flavor in UPSTREAM_FLAVORS or flavor in DEFAULT_FLAVORS:
         return None
     return (
-        f"Quickwit has no built-in flavor named `{flavor}`. "
+        f"BYOC has no built-in flavor named `{flavor}`. "
         "Ship the storage.s3 settings below verbatim instead of `flavor: "
         f"{flavor}`."
     )

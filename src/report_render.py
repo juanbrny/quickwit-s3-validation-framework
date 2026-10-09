@@ -73,6 +73,39 @@ def source_line(check):
     return '<p class="source">From ' + ", ".join(parts) + ".</p>" if parts else ""
 
 
+def result_explanation(report):
+    """One sentence under the result, in plain words."""
+    verdict = report["verdict"]
+    if verdict == "PASS":
+        if report.get("flavor") in ("none", "aws"):
+            return "Every deciding check passed, with BYOC's default storage settings."
+        return (
+            "Every deciding check passed. BYOC needs the storage settings this"
+            " report prints, under Compatibility."
+        )
+    if verdict == "FAIL":
+        return "At least one deciding check failed. The checks below say what to look at."
+    return (
+        "Nothing failed, but at least one deciding check could not be measured,"
+        " or not measured enough. The notes below say why."
+    )
+
+
+def later_stage_html(report):
+    items = report.get("later_stage") or []
+    if not items:
+        return ""
+    return (
+        "<h3>Tested at a later stage</h3><p>This is a synthetic test. These need"
+        " the real BYOC modules, so they are tested later, in the BYOC performance"
+        " tests. They never change this result.</p><ul>"
+        + "".join(
+            f"<li><strong>{esc(i['title'])}.</strong> {esc(i['detail'])}</li>" for i in items
+        )
+        + "</ul>"
+    )
+
+
 def ratio_cell(value):
     """Headroom: how close the measurement sits to its own limit."""
     if not isinstance(value, (int, float)) or isinstance(value, bool):
@@ -98,7 +131,12 @@ def line_chart(title, xvalues, series, xlabel, ylabel):
     """Inline SVG with an explicit scale and a corresponding data table."""
     if not xvalues:
         return '<p class="empty">No samples available.</p>'
-    colors = ["#087f8c", "#d98716", "#a54059"]
+    # The first series is the measurement, in Datadog purple. Every later
+    # series is a reference (a target, a minimum, a limit). A reference is not
+    # a second category, so it is drawn as a dashed grey line, not a hue.
+    # Checked with the dataviz validator against the white chart surface:
+    # 18.9 colour-blind separation and 20.8 normal-vision separation.
+    measured, reference = "#632ca6", "#6b6a66"
     values = [v for _, data in series for v in data if v is not None]
     high = max(values or [1]) * 1.12 or 1
     xmax = max(xvalues) or 1
@@ -111,7 +149,7 @@ def line_chart(title, xvalues, series, xlabel, ylabel):
     for step in range(5):
         v = high * step / 4
         parts.append(
-            f'<line x1="60" x2="680" y1="{y(v):.2f}" y2="{y(v):.2f}" stroke="#dfe7e8"/>'
+            f'<line x1="60" x2="680" y1="{y(v):.2f}" y2="{y(v):.2f}" stroke="#ebe8f0"/>'
         )
         parts.append(
             f'<text x="50" y="{y(v) + 4:.2f}" text-anchor="end">{v:.2g}</text>'
@@ -120,20 +158,30 @@ def line_chart(title, xvalues, series, xlabel, ylabel):
         v = xvalues[i]
         parts.append(f'<text x="{x(v):.2f}" y="242" text-anchor="middle">{v:g}</text>')
     for index, (label, data) in enumerate(series):
-        color = colors[index % len(colors)]
+        color = measured if index == 0 else reference
+        dash = "" if index == 0 else ' stroke-dasharray="6 4"'
         points = " ".join(
             f"{x(xv):.2f},{y(v):.2f}" for xv, v in zip(xvalues, data) if v is not None
         )
         parts.append(
-            f'<polyline points="{points}" fill="none" stroke="{color}" stroke-width="2.5"/>'
+            f'<polyline points="{points}" fill="none" stroke="{color}" stroke-width="2"{dash}/>'
         )
+        # Markers on the measurement only. A reference line is the same value
+        # everywhere, so markers on it would add noise and no information.
         for xv, v in zip(xvalues, data):
-            if v is not None:
+            if v is not None and index == 0:
                 parts.append(
-                    f'<circle cx="{x(xv):.2f}" cy="{y(v):.2f}" r="3" fill="{color}"><title>{esc(label)}: {v:.3g} at {xv:g}</title></circle>'
+                    f'<circle cx="{x(xv):.2f}" cy="{y(v):.2f}" r="4" fill="{color}"'
+                    f' stroke="#ffffff" stroke-width="2"><title>{esc(label)}: {v:.3g}'
+                    f" at {xv:g}</title></circle>"
                 )
+        # Legend: a short sample of the line, then the label in ink colour.
+        # Identity is never colour alone: the reference is also dashed.
+        lx = 60 + index * 205
         parts.append(
-            f'<text x="{60 + index * 205}" y="280" fill="{color}">{esc(label)}</text>'
+            f'<line x1="{lx}" x2="{lx + 22}" y1="276" y2="276" stroke="{color}"'
+            f' stroke-width="2"{dash}/>'
+            f'<text x="{lx + 30}" y="280" fill="#1f1a29">{esc(label)}</text>'
         )
     parts.extend(
         [
@@ -146,21 +194,21 @@ def line_chart(title, xvalues, series, xlabel, ylabel):
 
 
 CSS = """
-:root{--ink:#193239;--muted:#536b72;--line:#dce6e7;--teal:#087f8c}
-*{box-sizing:border-box}body{margin:0;background:#f2f6f5;color:var(--ink);font:15px/1.55 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-a{color:#096b7b;text-underline-offset:3px}main{max-width:1220px;margin:auto;padding:28px}
-.hero{background:#143e45;color:white;padding:36px;border-radius:18px}.eyebrow{font-size:12px;letter-spacing:2px;text-transform:uppercase;color:#a8dcdb;font-weight:650}
-h1{font-size:34px;line-height:1.15;margin:12px 0}h2{font-size:23px;margin:0 0 8px}h3{font-size:17px;margin:22px 0 8px}p{margin:8px 0 14px}.hero p{color:#d0e7e8;max-width:850px}.verdict{font-size:20px;font-weight:750;margin:22px 0 8px}
+:root{--ink:#1f1a29;--muted:#5f5a6b;--line:#e4e0ec;--brand:#632ca6;--brand-dark:#2b124c}
+*{box-sizing:border-box}body{margin:0;background:#f7f5fa;color:var(--ink);font:15px/1.55 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+a{color:var(--brand);text-underline-offset:3px}main{max-width:1220px;margin:auto;padding:28px}
+.hero{background:var(--brand-dark);color:white;padding:36px;border-radius:18px}.eyebrow{font-size:12px;letter-spacing:2px;text-transform:uppercase;color:#c4aef0;font-weight:650}
+h1{font-size:34px;line-height:1.15;margin:12px 0}h2{font-size:23px;margin:0 0 8px}h3{font-size:17px;margin:22px 0 8px}p{margin:8px 0 14px}.hero p{color:#d9cdef;max-width:850px}.verdict{font-size:20px;font-weight:750;margin:22px 0 8px}
 nav{display:flex;gap:18px;flex-wrap:wrap;padding:18px 0;font-weight:600;font-size:13px}
 section{background:white;border:1px solid var(--line);border-radius:14px;padding:28px;margin:0 0 20px;scroll-margin-top:15px}
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:22px}.stat{background:#ffffff12;border:1px solid #ffffff25;border-radius:10px;padding:12px 16px}.stat strong{display:block;font-size:25px}.stat span{font-size:12px;color:#d0e7e8}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}.meta{display:grid;grid-template-columns:160px 1fr;gap:8px 18px;margin:16px 0}.meta dt{color:var(--muted)}.meta dd{margin:0;overflow-wrap:anywhere}.muted,.empty{color:var(--muted)}.callout{background:#fff8e8;border-left:4px solid #d98716;padding:13px 16px;margin:16px 0}.sample{background:#e8f1ff;color:#244b78;border-radius:8px;padding:12px;margin-bottom:15px}
-.badge{display:inline-block;white-space:nowrap;font-size:11px;font-weight:750;letter-spacing:.3px;padding:4px 8px;border-radius:5px}.pass{background:#e3f3ec;color:#18664b}.fail{background:#fbe8e8;color:#a02a35}.missing{background:#edf1f4;color:#516471}.uncertain{background:#fff1d8;color:#885b13}
-.table-wrap{overflow:auto}table{border-collapse:collapse;width:100%;font-size:13px}th{text-align:left;background:#f3f7f7;color:#476068;font-size:11px;text-transform:uppercase;letter-spacing:.5px}th,td{padding:12px 10px;border-bottom:1px solid var(--line);vertical-align:top}td{overflow-wrap:anywhere}td:first-child{font-weight:600}.criteria td:first-child{min-width:190px}.criteria td:nth-child(2){min-width:170px}.criteria td:nth-child(3){min-width:190px}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:22px}.stat{background:#ffffff12;border:1px solid #ffffff25;border-radius:10px;padding:12px 16px}.stat strong{display:block;font-size:25px}.stat span{font-size:12px;color:#d9cdef}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}.meta{display:grid;grid-template-columns:160px 1fr;gap:8px 18px;margin:16px 0}.meta dt{color:var(--muted)}.meta dd{margin:0;overflow-wrap:anywhere}.muted,.empty{color:var(--muted)}.callout{background:#f4effb;border-left:4px solid var(--brand);padding:13px 16px;margin:16px 0}.sample{background:#efe8fa;color:#3b1a66;border-radius:8px;padding:12px;margin-bottom:15px}
+.badge{display:inline-block;white-space:nowrap;font-size:11px;font-weight:750;letter-spacing:.3px;padding:4px 8px;border-radius:5px}.pass{background:#e3f3ec;color:#18664b}.fail{background:#fbe8e8;color:#a02a35}.missing{background:#eeecf2;color:#4f4a5c}.uncertain{background:#fff1d8;color:#7a4f00}
+.table-wrap{overflow:auto}table{border-collapse:collapse;width:100%;font-size:13px}th{text-align:left;background:#f4f1f9;color:#4b3d63;font-size:11px;text-transform:uppercase;letter-spacing:.5px}th,td{padding:12px 10px;border-bottom:1px solid var(--line);vertical-align:top}td{overflow-wrap:anywhere}td:first-child{font-weight:600}.criteria td:first-child{min-width:190px}.criteria td:nth-child(2){min-width:170px}.criteria td:nth-child(3){min-width:190px}
 .questions{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;margin:18px 0}.question{border:1px solid var(--line);border-radius:12px;padding:16px}.question h3{margin:0 0 6px}.question p{margin:6px 0 0;font-size:13px}
-summary{cursor:pointer;color:#116e7b;font-weight:600}details{margin-top:10px}details p{font-weight:400}.tools{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:18px 0}input,select{font:inherit;padding:8px 10px;border:1px solid #a8bcc0;border-radius:6px;max-width:100%}input{min-width:240px}pre{background:#f3f7f7;padding:16px;border-radius:8px;overflow:auto;font-size:12px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere}svg{width:100%;height:auto}svg text{font:12px system-ui,sans-serif}code{font-size:12px}.bars{display:grid;grid-template-columns:180px 1fr;align-items:center;gap:10px;font-size:13px;margin:20px 0}.bar-track{height:27px;background:#edf3f3;position:relative}.bar{height:100%;background:#087f8c;min-width:2px}.bar.fail-bar{background:#b54b59}.bar-limit{position:absolute;border-left:2px dashed #d98716;top:-4px;bottom:-4px}.bar-label{position:absolute;right:6px;top:3px;font-size:11px;background:#ffffffdc;padding:0 3px}footer{color:var(--muted);font-size:12px;padding:0 4px 25px}ul{padding-left:22px}li{margin:6px 0}
+summary{cursor:pointer;color:var(--brand);font-weight:600}details{margin-top:10px}details p{font-weight:400}.tools{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:18px 0}input,select{font:inherit;padding:8px 10px;border:1px solid #c9c1d8;border-radius:6px;max-width:100%}input{min-width:240px}pre{background:#f4f1f9;padding:16px;border-radius:8px;overflow:auto;font-size:12px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere}svg{width:100%;height:auto}svg text{font:12px system-ui,sans-serif}code{font-size:12px}.bars{display:grid;grid-template-columns:180px 1fr;align-items:center;gap:10px;font-size:13px;margin:20px 0}.bar-track{height:27px;background:#f1eef6;position:relative}.bar{height:100%;background:var(--brand);min-width:2px}.bar.fail-bar{background:#d03b3b}.bar-limit{position:absolute;border-left:2px dashed #52514e;top:-4px;bottom:-4px}.bar-label{position:absolute;right:6px;top:3px;font-size:11px;background:#ffffffdc;padding:0 3px}footer{color:var(--muted);font-size:12px;padding:0 4px 25px}ul{padding-left:22px}li{margin:6px 0}
 @media(max-width:760px){main{padding:12px}.questions{grid-template-columns:1fr}.hero,section{padding:20px}.stats{grid-template-columns:1fr 1fr}.grid{grid-template-columns:1fr}.meta{grid-template-columns:120px 1fr}h1{font-size:28px}.bars{grid-template-columns:115px 1fr}}
-@media print{body{background:white;font-size:10pt}main{max-width:none;padding:0}.hero{background:#edf5f5;color:#193239}.hero p,.hero .eyebrow,.stat span{color:#34555c}section{padding:14px;border-radius:0;break-inside:auto}nav,.tools{display:none}details>*{display:block!important}summary{display:none}tr,svg,.callout{break-inside:avoid}.grid{display:block}a{color:inherit}.table-wrap{overflow:visible}pre{white-space:pre-wrap}}
+@media print{body{background:white;font-size:10pt}main{max-width:none;padding:0}.hero{background:#f4effb;color:#1f1a29}.hero p,.hero .eyebrow,.stat span{color:#3b1a66}section{padding:14px;border-radius:0;break-inside:auto}nav,.tools{display:none}details>*{display:block!important}summary{display:none}tr,svg,.callout{break-inside:avoid}.grid{display:block}a{color:inherit}.table-wrap{overflow:visible}pre{white-space:pre-wrap}}
 """
 SCRIPT = """
 const search=document.getElementById('search');
@@ -183,7 +231,7 @@ def render_html(report, links=None):
     parts = [
         '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
         f"<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-{script_hash}'; base-uri 'none'\">",
-        "<title>Quickwit S3 validation report</title><style>"
+        "<title>BYOC Logs storage validation report</title><style>"
         + CSS
         + "</style></head><body><main>",
     ]
@@ -191,18 +239,13 @@ def render_html(report, links=None):
         parts.append(
             '<div class="sample"><strong>Illustrative report.</strong> Synthetic data demonstrates the layout; these are not vendor measurements.</div>'
         )
-    explanation = {
-        "INCONCLUSIVE": "The evidence is incomplete. Read the checks below that are not measured, or not measured enough.",
-        "NOT CERTIFIED": "One or more required checks failed. The detailed results explain the measured gaps and what to investigate.",
-        "CERTIFIED": "Every required criterion passed with the default configuration.",
-        "CERTIFIED WITH DEVIATION": "Every required criterion passed with the configuration recorded below.",
-    }[report["verdict"]]
+    explanation = result_explanation(report)
     parts.append(
-        f'<header class="hero"><div class="eyebrow">Quickwit · Storage validation</div><h1>S3 compatibility &amp; performance</h1><p>{esc(run["identity"]["endpoint"])} · {esc(report["tier"])} tier · settings: <strong>{esc(flavor_label(report["flavor"]))}</strong></p><div class="verdict">{esc(report["verdict"])}</div><p>{explanation}</p><div class="stats">'
+        f'<header class="hero"><div class="eyebrow">Datadog BYOC Logs · Storage validation</div><h1>S3 compatibility &amp; performance</h1><p>{esc(run["identity"]["endpoint"])} · {esc(report["tier"])} tier · settings: <strong>{esc(flavor_label(report["flavor"]))}</strong></p><div class="verdict">{esc(report["verdict"])}</div><p>{explanation}</p><div class="stats">'
     )
     for state in ("PASS", "FAIL", "INCONCLUSIVE", "NOT RUN"):
         parts.append(
-            f'<div class="stat"><strong>{counts[state]}</strong><span>REQUIRED CHECKS · {state}</span></div>'
+            f'<div class="stat"><strong>{counts[state]}</strong><span>DECIDING CHECKS · {state}</span></div>'
         )
     parts.append(
         '</div></header><nav aria-label="Report sections">'
@@ -657,7 +700,7 @@ def render_html(report, links=None):
         note = flavor_note(rec)
         same = report["compatibility"].get("equivalent_flavors") or []
         parts.append(
-            f"<h3>Recommended Quickwit configuration · {esc(flavor_label(rec))}</h3>"
+            f"<h3>Recommended BYOC storage settings · {esc(flavor_label(rec))}</h3>"
             + (
                 '<p class="muted">These settings also carry the names '
                 + esc(", ".join(same))
@@ -729,7 +772,9 @@ def render_html(report, links=None):
         + "</section>"
     )
     parts.append(
-        '<section id="evidence"><h2>Evidence and scope</h2><div class="callout"><strong>Interpretation limits</strong><ul>'
+        '<section id="evidence"><h2>Evidence and scope</h2>'
+        + later_stage_html(report)
+        + '<div class="callout"><strong>How to read the numbers</strong><ul>'
         + "".join("<li>" + esc(v) + "</li>" for v in report["limitations"])
         + "</ul></div>"
     )
@@ -779,9 +824,11 @@ def render_markdown(report):
         return esc(v).replace("|", "&#124;").replace("\n", "<br>")
 
     lines = [
-        "# Quickwit S3 validation report",
+        "# BYOC Logs storage validation report",
         "",
         f"**{report['verdict']}** · Tier {report['tier']}",
+        "",
+        result_explanation(report),
         "",
         f"Run: {report['run']['run_id']} · Generated: {report['generated_at']}",
         "",
@@ -888,7 +935,14 @@ def render_markdown(report):
         if trace:
             lines.extend([f"From {trace}.", ""])
     lines += [
-        "## Scope",
+        "## Tested at a later stage",
+        "",
+        "This is a synthetic test. These need the real BYOC modules, so they are"
+        " tested later, in the BYOC performance tests. They never change this result.",
+        "",
+        *[f"- **{i['title']}.** {i['detail']}" for i in report.get("later_stage", [])],
+        "",
+        "## How to read the numbers",
         "",
         *["- " + v for v in report["limitations"]],
         "",

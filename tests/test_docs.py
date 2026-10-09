@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from run_certification import build_parser, require_connection
+from run_validation import build_parser, require_connection
 
 ROOT = Path(__file__).resolve().parent.parent
 USER_DOCS = [ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md"))]
@@ -30,7 +30,7 @@ DOCUMENTED_ENV = {
 
 
 def documented_commands(path):
-    """Every `python run_certification.py ...` command in one document."""
+    """Every `python run_validation.py ...` command in one document."""
     text = path.read_text()
     commands = []
     # Consume each fence with its language tag, so a ```text block cannot
@@ -39,7 +39,7 @@ def documented_commands(path):
         joined = block.replace("\\\n", " ")
         for line in joined.splitlines():
             line = line.strip()
-            if line.startswith("python run_certification.py"):
+            if line.startswith("python run_validation.py"):
                 commands.append(line)
     return commands
 
@@ -55,7 +55,7 @@ def test_the_documents_contain_commands_to_check():
 def test_every_documented_command_works_as_written(doc, command, monkeypatch):
     for name, value in DOCUMENTED_ENV.items():
         monkeypatch.setenv(name, value)
-    argv = shlex.split(command)[2:]  # drop "python run_certification.py"
+    argv = shlex.split(command)[2:]  # drop "python run_validation.py"
     parser = build_parser()
     args = parser.parse_args(argv)  # a missing or wrong flag exits here
     # `report` reads local files only. `cleanup` takes the endpoint and the
@@ -88,3 +88,39 @@ def test_every_link_between_documents_points_somewhere():
             if target.startswith("http"):
                 continue
             assert (path.parent / target).exists(), f"{path.name} links to missing {target}"
+
+
+def test_the_old_names_still_work(moto_server_endpoint, tmp_path):
+    """
+    The tool was `run_certification.py`, with a `certify` command. This is a
+    validation, not a formal certification, so both were renamed. Scripts
+    written for the old names must keep working.
+    """
+    import subprocess
+    import sys
+
+    from run_validation import main
+
+    old = subprocess.run(
+        [sys.executable, str(ROOT / "run_certification.py"), "--help"],
+        capture_output=True, text=True, cwd=ROOT,
+    )
+    assert old.returncode == 0 and "validate" in old.stdout
+    run = tmp_path / "old-command"
+    assert main(["certify", "--endpoint", moto_server_endpoint, "--bucket", "old-names",
+                 "--access-key", "testing", "--secret-key", "testing", "--run-dir", str(run),
+                 "--tier", "100GB", "--duration-min", "0.02", "--levels", "1,2",
+                 "--repeats", "1"]) == 0
+    assert (run / "report.html").exists()
+
+
+def test_reader_facing_text_never_says_certified():
+    """This is a synthetic validation. The result words are PASS, FAIL, INCONCLUSIVE."""
+    import re
+
+    for path in USER_DOCS:
+        for line in path.read_text().splitlines():
+            for m in re.finditer(r"CERTIFIED|[Cc]ertif(?!icate)", line):
+                assert "formal certification" in line or "run_certification" in line, (
+                    f"{path.name}: {line.strip()[:100]}"
+                )

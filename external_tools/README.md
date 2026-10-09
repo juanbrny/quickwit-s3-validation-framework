@@ -1,11 +1,8 @@
 # External tools (Layer 1 and raw-throughput cross-check)
 
-This framework does not reimplement generic S3 (Simple Storage Service) compliance checks.
-It also does not reimplement raw-throughput benchmarking.
-Mature open-source tools already do both well.
+This framework does not reimplement generic S3 (Simple Storage Service) compliance checks. It also does not reimplement raw-throughput benchmarking. Mature open-source tools already do both well.
 
-Run these tools first.
-If they fail, fix the underlying issue before you run anything in `src/`.
+Run these tools first. If they fail, fix the underlying issue before you run anything in `src/`.
 
 ## Ceph `s3-tests` (functional compliance)
 
@@ -32,10 +29,7 @@ S3TEST_CONF=s3tests.conf tox -- \
   s3tests_boto3/functional/test_s3.py -k "multipart or range or delete_multi or list_objects"
 ```
 
-Focus the `-k` filter on the operation families that Quickwit actually uses.
-See `docs/background/01_s3_interaction_analysis.md` §7 for the list.
-The full suite includes many ACL (Access Control List), versioning, and lifecycle tests.
-Quickwit never uses these operations, so a vendor should not need to pass them for this certification.
+Focus the `-k` filter on the operation families that Datadog BYOC Logs (BYOC) actually uses. See `docs/background/01_s3_interaction_analysis.md` §7 for the list. The full suite includes many ACL (Access Control List), versioning, and lifecycle tests. BYOC never uses these operations, so a vendor does not need to pass them for this validation.
 
 ## MinIO `mint` (containerized compliance, easier one-shot run)
 
@@ -48,11 +42,11 @@ docker run --rm \
   minio/mint:latest
 ```
 
-## MinIO `warp` (raw throughput/latency baseline, no Quickwit shape)
+## MinIO `warp` (raw throughput/latency baseline, no BYOC shape)
 
 Use this test to tell apart two cases:
 - The endpoint is generally slow.
-- The endpoint is slow only under Quickwit's specific mix of operations.
+- The endpoint is slow only under BYOC's specific mix of operations.
 
 To do this, run the test against both the vendor and AWS S3, using identical parameters.
 
@@ -70,16 +64,11 @@ warp mixed \
   --get-distrib=45 --put-distrib=45 --delete-distrib=5 --stat-distrib=5
 ```
 
-`warp`'s own report already gives p50, p90, and p99 latency and throughput.
-Keep both `warp` reports alongside the `src/report.py` output when you hand a
-certification report to the vendor or to Quickwit's maintainers.
-Together, the two reports show whether a gap is a generic-throughput issue or specific to Quickwit's operation mix.
+`warp`'s own report already gives p50, p90, and p99 latency and throughput. Keep both `warp` reports alongside the `src/report.py` output when you hand a validation report to the vendor or to the BYOC team. Together, the two reports show whether a gap is a generic-throughput issue or specific to BYOC's operation mix.
 
 ## Multipart minimum-part-size probe (edge case worth calling out separately)
 
-Real AWS S3 requires multipart parts to be at least 5 MiB, except for the last part.
-It also supports objects up to 5 TiB in size.
-Some appliances enforce different minimum or maximum sizes.
+Real AWS S3 requires multipart parts to be at least 5 MiB, except for the last part. It also supports objects up to 5 TiB in size. Some appliances enforce different minimum or maximum sizes.
 
 Use this manual check if `compat_checks.py`'s multipart check passes, but you want to find the exact boundaries:
 

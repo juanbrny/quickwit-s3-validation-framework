@@ -12,7 +12,7 @@ data, so most of these tests check what must survive.
 import boto3
 import pytest
 
-from run_certification import main
+from run_validation import main
 from src.cleanup import clean_run, run_prefix
 from src.qw_s3_client import QwS3Client, QwS3Config
 from src.run_store import read_json
@@ -31,7 +31,7 @@ def _keys(s3, bucket, prefix=""):
     return [o["Key"] for page in pages for o in page.get("Contents", [])]
 
 
-def test_certify_leaves_the_bucket_as_it_found_it(moto_server_endpoint, tmp_path):
+def test_validate_leaves_the_bucket_as_it_found_it(moto_server_endpoint, tmp_path):
     s3 = _s3(moto_server_endpoint)
     s3.create_bucket(Bucket="shared")
     # Someone else's data, including a key that looks like the tool's own.
@@ -39,7 +39,7 @@ def test_certify_leaves_the_bucket_as_it_found_it(moto_server_endpoint, tmp_path
     s3.put_object(Bucket="shared", Key="compat/path-style-0123.txt", Body=b"keep")
     s3.put_object(Bucket="shared", Key="qwcert/someone-elses-run/x", Body=b"keep")
     run = tmp_path / "run"
-    assert main(["certify", "--endpoint", moto_server_endpoint, "--bucket", "shared",
+    assert main(["validate", "--endpoint", moto_server_endpoint, "--bucket", "shared",
                  *KEYS, "--run-dir", str(run), *SHORT]) == 0
     run_id = read_json(run / "manifest.json")["run_id"]
     assert _keys(s3, "shared", f"qwcert/{run_id}/") == []
@@ -56,7 +56,7 @@ def test_every_object_a_run_writes_is_inside_its_own_folder(moto_server_endpoint
     """The rule that makes a safe cleanup possible at all."""
     s3 = _s3(moto_server_endpoint)
     run = tmp_path / "run"
-    assert main(["certify", "--endpoint", moto_server_endpoint, "--bucket", "own-folder",
+    assert main(["validate", "--endpoint", moto_server_endpoint, "--bucket", "own-folder",
                  *KEYS, "--run-dir", str(run), *SHORT, "--keep-objects"]) == 0
     run_id = read_json(run / "manifest.json")["run_id"]
     keys = _keys(s3, "own-folder")
@@ -68,7 +68,7 @@ def test_every_object_a_run_writes_is_inside_its_own_folder(moto_server_endpoint
 def test_cleanup_can_run_later_and_twice(moto_server_endpoint, tmp_path):
     s3 = _s3(moto_server_endpoint)
     run = tmp_path / "run"
-    main(["certify", "--endpoint", moto_server_endpoint, "--bucket", "later",
+    main(["validate", "--endpoint", moto_server_endpoint, "--bucket", "later",
           *KEYS, "--run-dir", str(run), *SHORT, "--keep-objects"])
     assert _keys(s3, "later")
     assert main(["cleanup", "--run-dir", str(run), *KEYS]) == 0
@@ -117,7 +117,7 @@ def test_a_wrong_run_id_is_refused_rather_than_widening_the_prefix(bad):
 
 
 def test_cleanup_refuses_a_run_that_is_still_going(tmp_path):
-    from run_certification import cleanup_run
+    from run_validation import cleanup_run
 
     (tmp_path / ".running").write_text("")
     with pytest.raises(ValueError, match="still running"):

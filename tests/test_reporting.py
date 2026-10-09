@@ -23,7 +23,7 @@ from examples.make_sample_report import make_bundle
 from pathlib import Path
 
 ROOT_REPORTS = Path(__file__).resolve().parent.parent / "reports"
-from run_certification import main
+from run_validation import main
 
 
 @pytest.fixture
@@ -71,10 +71,10 @@ def test_throttles_are_separate_from_non_throttle_errors():
     "statuses,expected",
     [
         ([], "INCONCLUSIVE"),
-        (["PASS"], "CERTIFIED"),
+        (["PASS"], "PASS"),
         (["PASS", "NOT RUN"], "INCONCLUSIVE"),
         (["PASS", "INCONCLUSIVE"], "INCONCLUSIVE"),
-        (["FAIL", "NOT RUN"], "NOT CERTIFIED"),
+        (["FAIL", "NOT RUN"], "FAIL"),
     ],
 )
 def test_overall_requires_complete_evidence(statuses, expected):
@@ -83,10 +83,10 @@ def test_overall_requires_complete_evidence(statuses, expected):
     ]
     assert overall(checks, "none") == expected
     if statuses == ["PASS"]:
-        assert overall(checks, "minio") == "CERTIFIED WITH DEVIATION"
-        # AWS S3 is a target in its own right, not only the baseline. Its
-        # flavor keeps every default, so it needs no deviation.
-        assert overall(checks, "aws") == "CERTIFIED"
+        # Special storage settings do not change the result. The report says
+        # which settings are needed, beside the result.
+        assert overall(checks, "minio") == "PASS"
+        assert overall(checks, "aws") == "PASS"
 
 
 def test_aws_flavor_agrees_with_a_recommendation_of_none(bundle):
@@ -123,7 +123,6 @@ def test_report_uses_saved_thresholds_and_detects_flavor_mismatch(bundle, tmp_pa
     result = build_report(bundle, baseline)
     assert indexed(result)["query_wall_clock_p99"]["status"] == "PASS"
     assert indexed(result)["flavor"]["status"] == "INCONCLUSIVE"
-    assert indexed(result)["merge_backlog"]["status"] == "NOT RUN"
 
 
 def test_baseline_mismatch_is_inconclusive(bundle, tmp_path):
@@ -469,7 +468,7 @@ def test_real_cli_flow_against_local_emulator(moto_server_endpoint, tmp_path):
     assert main(["load", *common, "--tier", "100GB", "--duration-min", "0.01"]) == 0
     assert main(["report", "--run-dir", str(run)]) == 0
     report = read_json(run / "report.json")
-    assert report["verdict"] not in ("CERTIFIED", "CERTIFIED WITH DEVIATION")
+    assert report["verdict"] != "PASS"
     assert len(report["measurements"]) > 0
     assert len(report["sweeps"]["put-fanout"]["levels"]) == 2
     assert load_bundle(run)[1] == []
@@ -519,7 +518,7 @@ CONNECTION_ENV = (
 )
 
 
-def test_certify_runs_every_stage_with_the_recommended_flavor(
+def test_validate_runs_every_stage_with_the_recommended_flavor(
     moto_server_endpoint, tmp_path
 ):
     """
@@ -527,13 +526,13 @@ def test_certify_runs_every_stage_with_the_recommended_flavor(
     recommends is carried into the performance stages automatically, which is
     the step that used to be copied by hand.
     """
-    run = tmp_path / "certify"
+    run = tmp_path / "validate"
     assert (
         main(
             [
-                "certify",
+                "validate",
                 "--endpoint", moto_server_endpoint,
-                "--bucket", "qw-certify",
+                "--bucket", "qw-validate",
                 "--access-key", "testing",
                 "--secret-key", "testing",
                 "--run-dir", str(run),
@@ -554,7 +553,7 @@ def test_certify_runs_every_stage_with_the_recommended_flavor(
     assert indexed(read_json(run / "report.json"))["flavor"]["status"] == "PASS"
 
 
-def test_certify_takes_connection_settings_from_the_environment(
+def test_validate_takes_connection_settings_from_the_environment(
     moto_server_endpoint, tmp_path, monkeypatch
 ):
     """The usual command should be short, so every connection setting has an
@@ -562,16 +561,16 @@ def test_certify_takes_connection_settings_from_the_environment(
     for name in CONNECTION_ENV:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("QW_S3_ENDPOINT", moto_server_endpoint)
-    monkeypatch.setenv("QW_S3_BUCKET", "qw-certify-env")
+    monkeypatch.setenv("QW_S3_BUCKET", "qw-validate-env")
     monkeypatch.setenv("QW_S3_ACCESS_KEY", "testing")
     monkeypatch.setenv("QW_S3_SECRET_KEY", "testing")
     run = tmp_path / "env"
     assert (
-        main(["certify", "--run-dir", str(run), "--tier", "100GB",
+        main(["validate", "--run-dir", str(run), "--tier", "100GB",
               "--duration-min", "0.01", "--levels", "1,2", "--repeats", "1"])
         == 0
     )
-    assert read_json(run / "manifest.json")["identity"]["bucket"] == "qw-certify-env"
+    assert read_json(run / "manifest.json")["identity"]["bucket"] == "qw-validate-env"
 
 
 def test_missing_connection_settings_name_their_environment_variable(monkeypatch, capsys):
@@ -598,7 +597,7 @@ def test_an_empty_shell_variable_is_reported_as_empty(monkeypatch, capsys):
     assert "--secret-key" not in error
 
 
-def test_certify_stops_when_no_flavor_works(moto_server_endpoint, tmp_path, monkeypatch):
+def test_validate_stops_when_no_flavor_works(moto_server_endpoint, tmp_path, monkeypatch):
     """
     Running the performance stages after a failed compatibility probe would
     measure a configuration that does not work. Stop instead.
@@ -611,13 +610,13 @@ def test_certify_stops_when_no_flavor_works(moto_server_endpoint, tmp_path, monk
     )
     run = tmp_path / "nogo"
     with pytest.raises(SystemExit):
-        main(["certify", "--endpoint", moto_server_endpoint, "--bucket", "qw-nogo",
+        main(["validate", "--endpoint", moto_server_endpoint, "--bucket", "qw-nogo",
               "--access-key", "testing", "--secret-key", "testing",
               "--run-dir", str(run), "--tier", "100GB", "--duration-min", "0.01"])
     assert set(read_json(run / "manifest.json")["stages"]) == {"compat"}
 
 
-def test_certify_runs_the_baseline_leg_with_matching_metadata(
+def test_validate_runs_the_baseline_leg_with_matching_metadata(
     moto_server_endpoint, tmp_path
 ):
     """
@@ -630,7 +629,7 @@ def test_certify_runs_the_baseline_leg_with_matching_metadata(
     assert (
         main(
             [
-                "certify",
+                "validate",
                 "--endpoint", moto_server_endpoint,
                 "--bucket", "qw-vendor-leg",
                 "--access-key", "testing",
@@ -700,11 +699,11 @@ def test_every_check_belongs_to_one_question(bundle):
         assert group["status"] == worst, group["id"]
 
 
-def test_exactly_ten_checks_decide_the_result(bundle):
+def test_exactly_nine_checks_decide_the_result(bundle):
     """
-    Thirty-eight checks decided the result before, and nobody could explain
-    them. Ten do now. The rest stay in the report as information only, so no
-    measurement is lost, only the noise in the result.
+    Thirty-eight checks decided the result once, and nobody could explain
+    them. Nine do now. Merge backlog left the list: this tool cannot test it,
+    so it is listed for the later stage instead of blocking every result.
     """
     report = build_report(bundle)
     deciding = [c for c in report["checks"] if c["required"]]
@@ -712,7 +711,6 @@ def test_exactly_ten_checks_decide_the_result(bundle):
         "compatibility",
         "throughput",
         "query_rate",
-        "merge_backlog",
         "response_time",
         "failed_requests",
         "slowed_requests",
@@ -790,7 +788,7 @@ def test_a_missing_operation_never_hides_a_failure(bundle):
     result = indexed(report)["response_time"]
     assert result["status"] == "FAIL"
     assert "never ran: Merge object read" in result["observed"]
-    assert report["verdict"] == "NOT CERTIFIED"
+    assert report["verdict"] == "FAIL"
 
 
 def test_a_missing_operation_makes_a_clean_summary_inconclusive():
@@ -829,26 +827,32 @@ def test_headroom_always_fails_above_one(observed, limit, at_most, expected):
         assert result == pytest.approx(expected)
 
 
-def test_report_states_the_certification_ceiling_prominently(bundle):
+def test_nothing_untestable_holds_a_result_back(bundle):
     """
-    Merge backlog is a required criterion with no measurement, so CERTIFIED is
-    unreachable today. The report must say that once, where it cannot be
-    missed, instead of leaving the reader to infer it from a NOT RUN row.
+    A merge-backlog check that could never run used to make every result
+    INCONCLUSIVE at best, however well the storage did. Anything this tool
+    cannot test is now listed for the later stage, and a run can PASS.
     """
     report = build_report(bundle)
-    assert report["best_possible_verdict"] == "INCONCLUSIVE"
-    # Found by title, not by position: other notices, such as a short-run
-    # warning, may come first.
-    headline = next(
-        h for h in report["headline_limits"] if "certification" in h["title"].lower()
-    )
-    assert "merge backlog" in headline["detail"].lower()
-    assert "never CERTIFIED" in headline["detail"]
+    deciding = [c for c in report["checks"] if c["required"]]
+    # A complete run: no deciding check is unmeasurable by design.
+    assert not [c["id"] for c in deciding if c["status"] == "NOT RUN"]
+    # The sample run fails two checks on purpose. Fix those two, and it passes.
+    for c in deciding:
+        if c["status"] == "FAIL":
+            c["status"] = "PASS"
+    assert overall(report["checks"], report["flavor"]) == "PASS"
+
+
+def test_what_cannot_be_tested_is_listed_for_the_later_stage(bundle):
+    report = build_report(bundle)
+    titles = [item["title"] for item in report["later_stage"]]
+    assert "Merge backlog" in titles and "Full-size merges" in titles
     html = render_html(report)
-    assert "What this report can conclude" in html
-    assert headline["detail"] in html
-    # The same statement must not also sit in the detailed scope list.
-    assert not any("backlog" in note for note in report["limitations"])
+    assert "Tested at a later stage" in html
+    assert "never change this result" in html
+    assert "## Tested at a later stage" in render_markdown(report)
+    assert not any("CERTIFIED" in h["detail"] for h in report["headline_limits"])
 
 
 def test_per_operation_criteria_are_shown_once_as_a_matrix(bundle):
@@ -886,7 +890,7 @@ def test_baseline_credentials_are_checked_before_the_soak(tmp_path, monkeypatch)
         monkeypatch.delenv(name, raising=False)
     run = tmp_path / "early"
     with pytest.raises(SystemExit):
-        main(["certify", "--endpoint", "https://s3.vendor.test", "--bucket", "b",
+        main(["validate", "--endpoint", "https://s3.vendor.test", "--bucket", "b",
               "--access-key", "a", "--secret-key", "s", "--tier", "1TB",
               "--run-dir", str(run), "--with-aws-baseline"])
     assert not run.exists()
@@ -964,7 +968,7 @@ def test_a_connection_failure_is_not_reported_as_incompatibility(monkeypatch, ca
         },
     )
     with pytest.raises(SystemExit):
-        main(["certify", "--endpoint", moto_server_endpoint, "--bucket", "b",
+        main(["validate", "--endpoint", moto_server_endpoint, "--bucket", "b",
               "--access-key", "AKIAEXAMPLE", "--secret-key", "s",
               "--run-dir", str(tmp_path / "run"), "--tier", "100GB"])
     out = capsys.readouterr()
@@ -979,7 +983,7 @@ def test_the_run_says_where_the_keys_came_from(monkeypatch, capsys):
     that silently picks up the wrong ones fails with a signature error and no
     clue. Say the source, and never the secret.
     """
-    import run_certification
+    import run_validation
 
     for name in CONNECTION_ENV:
         monkeypatch.delenv(name, raising=False)
@@ -987,7 +991,7 @@ def test_the_run_says_where_the_keys_came_from(monkeypatch, capsys):
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "do-not-print-me")
     args = Namespace(access_key="ASIAEXAMPLEKEY", secret_key="do-not-print-me",
                      session_token=None)
-    run_certification.describe_credentials(args, [])
+    run_validation.describe_credentials(args, [])
     out = capsys.readouterr().out
     assert "$AWS_ACCESS_KEY_ID" in out
     assert "ASIA" in out and "WITHOUT a session token" in out
@@ -1075,17 +1079,17 @@ def test_the_default_settings_are_named_not_shown_as_none(bundle):
     """ "flavor: none" read like a missing value. It means Quickwit's defaults."""
     from src.qw_s3_client import flavor_label
 
-    assert flavor_label("none") == "Quickwit defaults (no flavor setting)"
+    assert flavor_label("none") == "BYOC defaults (no flavor setting)"
     manifest = read_json(bundle / "manifest.json")
     for stage in ("fanout", "put-fanout", "load"):
         manifest["stages"][stage]["options"]["flavor"] = "none"
     write_json(bundle / "manifest.json", manifest)
     html = render_html(build_report(bundle))
-    assert "Quickwit defaults (no flavor setting)" in html
+    assert "BYOC defaults (no flavor setting)" in html
     assert "actual flavor" not in html
 
 
-def test_certify_uses_the_flavor_you_choose(moto_server_endpoint, tmp_path):
+def test_validate_uses_the_flavor_you_choose(moto_server_endpoint, tmp_path):
     """
     The probe picks the mildest settings that work, so against a compliant
     system it picks Quickwit's defaults and never tests storagegrid. An
@@ -1094,7 +1098,7 @@ def test_certify_uses_the_flavor_you_choose(moto_server_endpoint, tmp_path):
     """
     run = tmp_path / "chosen"
     assert main([
-        "certify", "--endpoint", moto_server_endpoint, "--bucket", "qw-chosen",
+        "validate", "--endpoint", moto_server_endpoint, "--bucket", "qw-chosen",
         "--access-key", "testing", "--secret-key", "testing",
         "--run-dir", str(run), "--runner-location", "local",
         "--tier", "100GB", "--duration-min", "0.01", "--levels", "1,2", "--repeats", "1",
@@ -1112,7 +1116,7 @@ def test_certify_uses_the_flavor_you_choose(moto_server_endpoint, tmp_path):
     assert report["flavor"]["status"] == "PASS"
 
 
-def test_certify_stops_when_the_chosen_flavor_fails(moto_server_endpoint, tmp_path,
+def test_validate_stops_when_the_chosen_flavor_fails(moto_server_endpoint, tmp_path,
                                                      monkeypatch, capsys):
     from src import compat_checks
 
@@ -1128,7 +1132,7 @@ def test_certify_stops_when_the_chosen_flavor_fails(moto_server_endpoint, tmp_pa
         },
     })
     with pytest.raises(SystemExit):
-        main(["certify", "--endpoint", moto_server_endpoint, "--bucket", "b",
+        main(["validate", "--endpoint", moto_server_endpoint, "--bucket", "b",
               "--access-key", "a", "--secret-key", "s", "--run-dir", str(tmp_path / "r"),
               "--tier", "100GB", "--flavor", "storagegrid"])
     error = capsys.readouterr().err
@@ -1187,11 +1191,11 @@ def test_a_placed_pause_leaves_only_its_own_minutes_out(bundle):
 
 
 def test_the_pause_watch_notices_a_sleep(monkeypatch):
-    import run_certification
+    import run_validation
 
     clock = {"wall": 1000.0, "mono": 50.0}
-    monkeypatch.setattr(run_certification.time, "time", lambda: clock["wall"])
-    monkeypatch.setattr(run_certification.time, "monotonic", lambda: clock["mono"])
+    monkeypatch.setattr(run_validation.time, "time", lambda: clock["wall"])
+    monkeypatch.setattr(run_validation.time, "monotonic", lambda: clock["mono"])
 
     class Ticks:
         """Stop after three seconds; the second one hides a 40-second sleep."""
@@ -1204,7 +1208,7 @@ def test_the_pause_watch_notices_a_sleep(monkeypatch):
             clock["wall"] += 41.0 if self.n == 2 else 1.0
             return self.n > 3
 
-    watch = run_certification.PauseWatch(Ticks())
+    watch = run_validation.PauseWatch(Ticks())
     watch.run()
     assert len(watch.pauses) == 1
     assert watch.pauses[0]["seconds"] == pytest.approx(40.0)
@@ -1216,10 +1220,56 @@ def test_a_run_keeps_the_mac_awake(monkeypatch):
     import shutil
     import subprocess
 
-    import run_certification
+    import run_validation
 
     calls = []
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/caffeinate")
     monkeypatch.setattr(subprocess, "Popen", lambda argv, **kw: calls.append(argv) or object())
-    run_certification.keep_awake()
+    run_validation.keep_awake()
     assert calls == [["/usr/bin/caffeinate", "-i", "-s", "-w", str(os.getpid())]]
+
+
+@pytest.mark.parametrize(
+    "count,p99,p50,slowest,expected",
+    [
+        (100, 0.9, 0.5, 1.2, "PASS"),          # enough samples: the p99 decides
+        (100, 1.1, 0.5, 1.2, "FAIL"),
+        (30, 0.95, 0.5, 0.99, "PASS"),         # few: every sample within the limit
+        (30, 2.6, 2.46, 2.61, "FAIL"),         # few: the median is over the limit
+        (3, 0.258, 0.221, 0.258, "INCONCLUSIVE"),  # few: some over, median under
+        (2, 0.1, 0.1, 0.1, "INCONCLUSIVE"),    # too few to say anything
+    ],
+)
+def test_rare_operations_are_judged_on_what_the_samples_prove(count, p99, p50, slowest, expected):
+    """
+    At 100 GB/day a merge runs about every 10 minutes, so 100 merge samples
+    would take about 17 hours, and such a run could never pass. With fewer
+    samples, PASS needs every sample within the limit, and FAIL needs the
+    median over it: then the p99 is over it too.
+    """
+    from src.report_model import latency_result
+
+    status, note = latency_result(count, p99, p50, slowest, limit=1.0 if count != 3 else 0.255,
+                                  minimum=100)
+    assert status == expected
+    if 3 <= count < 100:
+        assert note.startswith(" (few samples")
+
+
+def test_a_rare_operation_is_never_judged_without_a_limit():
+    from src.report_model import latency_result
+
+    assert latency_result(50, 0.1, 0.1, 0.1, limit=None, minimum=100)[0] == "INCONCLUSIVE"
+
+
+def test_the_storagegrid_uploads_fail_on_their_median():
+    """
+    Recorded from a 30-minute StorageGRID run: 30 split uploads, every one at
+    about 11 MB/s, median 2,458 ms against a 745 ms limit. Two hours of waiting
+    for 100 samples would not change that answer.
+    """
+    from src.report_model import latency_result
+
+    status, note = latency_result(30, 2.610, 2.458, 2.610, limit=0.745, minimum=100)
+    assert status == "FAIL"
+    assert "median is over the limit" in note

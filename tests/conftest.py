@@ -8,7 +8,7 @@ single-PutObject when multipart is disabled, etc. They run against `moto`
 (an in-memory S3 emulator), not a real bucket, so they're fast, free, and
 need no credentials.
 
-They are NOT a substitute for running run_certification.py against a real
+They are NOT a substitute for running run_validation.py against a real
 vendor endpoint -- moto emulates AWS S3's behavior closely, but a vendor's
 actual implementation is exactly what's in question when you run this
 framework for real. Think of these tests as "does our checker work

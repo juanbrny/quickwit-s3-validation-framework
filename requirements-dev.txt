@@ -1,5 +1,5 @@
 # Only needed to run the framework's own test suite (tests/) -- not needed
-# to run run_certification.py against a real vendor endpoint.
+# to run run_validation.py against a real vendor endpoint.
 pytest>=7.4
 # server extra pulls in Flask/Werkzeug, needed for ThreadedMotoServer --
 # tests/test_concurrency_fanout.py runs the asyncio fanout sweep against a

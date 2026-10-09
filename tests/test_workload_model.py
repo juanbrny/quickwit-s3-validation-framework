@@ -1,6 +1,6 @@
 """
 Pure-math tests for workload_model.py -- no S3, no moto, just verifying the
-op-mix formulas in docs/03_throughput_tier_sizing.md behave as documented.
+op-mix formulas in docs/background/03_throughput_tier_sizing.md behave as documented.
 """
 import pytest
 

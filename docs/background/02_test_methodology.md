@@ -1,14 +1,14 @@
 # Test Methodology
 
 **Implementation and reporting status:** see
-[Measurement policy](measurement_policy.md), and
-[Run a validation](run_a_validation.md) for the commands.
-The HTML report evaluates available evidence and explicitly marks missing gates.
+[Measurement policy](../measurement_policy.md), and
+[Run a validation](../run_a_validation.md) for the commands.
+The HTML report uses the evidence it has, and says clearly what is missing.
 The current simulator does not measure an independent merge backlog and therefore
 cannot issue full tier certification. The requirements below describe the intended
 certification bar, not a claim that every measurement is already implemented.
 
-This methodology uses three gated layers. A vendor must clear layer N before
+This methodology uses three decided layers. A vendor must clear layer N before
 layer N+1 is worth running. For example, a 1 PB/day soak test against an
 endpoint that fails basic multipart semantics has no value.
 
@@ -27,8 +27,8 @@ test suites instead of building new ones:
   `s3-tests`, the `aws-sdk-*` client suites, and its own tests. It runs as a
   single container against any endpoint, so it is the easiest option to run.
 
-Gate: **zero failures** in the subset of tests relevant to the operations
-listed in `docs/01_s3_interaction_analysis.md` §7. These operations are
+To pass: **zero failures** in the subset of tests relevant to the operations
+listed in `docs/background/01_s3_interaction_analysis.md` §7. These operations are
 multipart, delete, range-GET, and list.
 
 Failures outside that subset don't block certification. For example, bucket
@@ -52,7 +52,7 @@ the endpoint work:
    ship. This artifact is the most useful one for Quickwit's maintainers,
    because it is a candidate `flavor` value.
 
-Gate: **at least one working configuration exists.** A vendor that only
+To pass: **at least one working configuration exists.** A vendor that only
 works with three overrides set does not FAIL. It gets a "PASS WITH
 DEVIATION" result. Upstream already handles `gcs` and `digital_ocean` the
 same way. The `none` and `aws` flavors set no override, so they are the only
@@ -76,7 +76,7 @@ requests to hide Simple Storage Service (S3)-style per-request latency
 behind them?** This question determines whether the architecture works on
 a given backend.
 
-Per `docs/01_s3_interaction_analysis.md` §5a, Quickwit has no way to make a
+Per `docs/background/01_s3_interaction_analysis.md` §5a, Quickwit has no way to make a
 single S3 request faster. This applies to any bring-your-own-cloud (BYOC)
 deployment of it, too.
 
@@ -91,7 +91,7 @@ connection pool sized too small, or per-connection throttling. In these
 cases, query latency scales with the GET count, regardless of how fast any
 individual request was.
 
-`run_certification.py fanout` tests this directly and in isolation. It
+`run_certification.py read-concurrency` tests this directly and in isolation. It
 runs in seconds, rather than the minutes to hours a full Layer 3 soak test
 takes:
 
@@ -108,9 +108,10 @@ takes:
    toward `1/concurrency` means the backend processed the "concurrent"
    requests essentially one at a time.
 
-Gate: efficiency must stay at or above `fanout_efficiency_min` at every
-tested concurrency level. The default value is 0.4, set in
-`config/tiers.yaml`. No throttling should appear at any level.
+To pass: a batch of concurrent requests must finish at least twice as fast
+as one-by-one handling, at every level. The setting is
+`fanout_serialization_min_speedup` in `config/tiers.yaml`. No request may
+fail, and no request may be throttled.
 
 The framework reports the first level where efficiency drops below that
 floor as `degrades_at_concurrency`. Past that point, the framework cannot
@@ -120,7 +121,7 @@ test.
 
 This is a pre-flight check, not a replacement for Layer 3. A backend that
 fails the fan-out sweep badly will almost certainly also fail Layer 3's
-query-latency criteria. Failing fast here saves the cost of a full soak
+query-latency checks. Failing fast here saves the cost of a full soak
 run.
 
 `run_certification.py load` (Layer 3) also measures the same property
@@ -149,7 +150,7 @@ meaningful against a real endpoint.
 
 For a chosen tier, from 100 GB to 1 PB per day, `run_certification.py load`
 does the following. A 10 PB/day `extreme_tiers` entry also exists for the
-rare customer at that scale, but it is gated behind
+rare customer at that scale, but it needs
 `--confirm-extreme-cost` — see `03_throughput_tier_sizing.md` for why.
 
 1. Computes the target operation mix using `src/workload_model.py`. See
@@ -229,5 +230,5 @@ terms".
   #5399 flags this scope; the framework does not cover it here.
 - Multi-writer metastore compare-and-swap (CAS) semantics; see analysis doc
   §6. Current Quickwit does not rely on this, so the framework does not
-  gate on it. The framework still records the probe results, for
+  decide the result on it. The framework still records the probe results, for
   forward-compatibility interest.

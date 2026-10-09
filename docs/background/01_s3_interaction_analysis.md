@@ -186,7 +186,7 @@ architecture depends on. A naive single-request latency benchmark would
 never catch this failure.
 
 See `concurrency_fanout.py` and the "Layer 2.5" section of
-`docs/02_test_methodology.md` for how this suite tests for that directly.
+`docs/background/02_test_methodology.md` for how this suite tests for that directly.
 See the `query_wall_clock` metric in `query_sim.py` for how the suite
 monitors the same property under realistic mixed traffic.
 

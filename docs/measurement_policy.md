@@ -1,7 +1,7 @@
 # Measurement policy
 
 This page is the normative reference. It states exactly how each number is
-computed and how each verdict is decided. Read
+computed and how each result is decided. Read
 [Run a validation](run_a_validation.md) to run the tool, and
 [Read the report](read_the_report.md) to interpret the output.
 
@@ -12,41 +12,71 @@ current contents of the configuration file.
 Abbreviations used below: Amazon Web Services (AWS), Simple Storage Service
 (S3), JavaScript Object Notation (JSON), 99th percentile (p99).
 
-## Verdicts
+## Results
 
-Per criterion:
+Per check:
 
-- **PASS:** the criterion has adequate evidence and meets its threshold.
-- **FAIL:** an evaluated criterion violates its threshold.
+- **PASS:** the check has adequate evidence and meets its threshold.
+- **FAIL:** an evaluated check violates its threshold.
 - **NOT RUN:** the required measurement or stage is absent.
 - **INCONCLUSIVE:** evidence is insufficient, invalid, interrupted or
   incompatible.
 
-Overall:
+Ten checks decide the overall result. They are listed in
+[What this tool measures](what_this_measures.md#the-ten-checks-that-decide-the-result).
 
-- Any required criterion FAIL gives NOT CERTIFIED.
-- Otherwise, any required criterion that is not PASS gives INCONCLUSIVE.
-- All required criteria PASS gives CERTIFIED with the `none` or `aws` flavor,
-  and CERTIFIED WITH DEVIATION with any other flavor.
+- If any deciding check fails, the result is NOT CERTIFIED.
+- Otherwise, if any deciding check is not PASS, the result is INCONCLUSIVE.
+- If all ten pass with the `none` or `aws` flavor, the result is CERTIFIED.
+- If all ten pass with any other flavor, the result is CERTIFIED WITH
+  DEVIATION.
 
-Optional diagnostics never determine the overall verdict. Malformed input
-reports an explicit validation error, never a passing verdict.
+Every other check is information only. It is shown, and it never changes the
+result.
+
+Three deciding checks summarize every operation: response time, failed
+requests, and slowed-down requests. Each takes the worst result of its
+operations. If an operation the workload should produce has no samples, the
+check is NOT RUN. A single slow operation therefore fails the response time
+check, and a missing operation never passes it.
+
+Malformed input reports a validation error, never a passing result.
 
 ## Current simulator limit
 
 Merge processing is synchronous inside the indexer workers. There is no
 independent queue that measures merge backlog under a fixed offered ingestion
-rate. The merge-backlog criterion is therefore always NOT RUN, and the overall
-verdict cannot reach CERTIFIED.
+rate. The merge-backlog check is therefore always NOT RUN, and the overall
+result cannot reach CERTIFIED.
 
 There is deliberately no flag to hide or bypass this missing evidence.
 Implement independent merge scheduling and backlog telemetry before enabling
-that gate.
+that check.
 
 Merged payloads are capped at 160 MB to limit test cost. The cap sits just
 above Quickwit's 128 MiB multipart threshold, so the soak does exercise the
 multipart path. It does not exercise a real 8 GB mature split, where transfer
 rate dominates. The report states this.
+
+## When the test machine stops
+
+A run measures the storage only while the test machine is running. During a
+run the tool checks every second whether the wall clock and the process clock
+still agree. The wall clock keeps counting while the machine sleeps; the
+process clock does not. A difference of more than 5 seconds is a pause.
+
+Each pause is saved with its start and length. The report then leaves out:
+
+- every request that ran during the pause or the 60 seconds after it,
+- every one-minute window that overlaps that time,
+- every visibility check that ran during that time.
+
+Runs recorded before pauses were tracked only show the total pause, not when it
+happened. For those runs, any time-based check that fails reads INCONCLUSIVE,
+because the failure cannot be told apart from the pause.
+
+On a Mac, the tool runs `caffeinate` for as long as the run lasts, which stops
+idle sleep.
 
 ## Evidence policy
 
@@ -65,7 +95,7 @@ not detect deliberate tampering.
   guarantee. Sparse merge or deletion samples may need substantially longer
   runs.
 - `window_seconds`: 60 seconds, for sustained throughput and throttling.
-- `minimum_complete_windows`: 3, before any sustained-rate criterion can pass.
+- `minimum_complete_windows`: 3, before any sustained-rate check can pass.
 
 ## Latency
 
@@ -82,7 +112,7 @@ pass/fail configuration.
 
 Headroom is the measurement divided by its own limit. For an "at least"
 requirement the ratio is inverted, so a value above 1.00× always means the
-criterion failed.
+check failed.
 
 ## Throughput
 
@@ -92,7 +122,7 @@ indexed-byte ingestion rate, not against all S3 traffic and not against raw log
 volume.
 
 Every complete window must reach 95% of its target. Idle windows count as zero
-throughput. A partial final window appears in the timeline but is not gated.
+throughput. A partial final window appears in the timeline but is not decided.
 Startup is included; mixed-workload measurements have no hidden warm-up
 exclusion.
 
@@ -103,7 +133,7 @@ Successful simulated query rate is evaluated separately, the same way.
 Throttling uses each operation's non-empty complete windows. The worst window
 must be at or below the configured sustained maximum, and the median window
 must be zero. Empty operation windows are excluded, and coverage is checked as
-its own criterion.
+its own check.
 
 Non-throttle errors exclude throttles, which are evaluated separately.
 
@@ -112,6 +142,28 @@ Non-throttle errors exclude throttles, which are evaluated separately.
 Each sweep keeps the median-duration trial at every concurrency level. The
 report shows the actual levels, object sizes and repeat count. Both the read
 and the write sweep are evaluated.
+
+The rule tests for serialization, set by `fanout_serialization_min_speedup` and
+`put_fanout_serialization_min_speedup`, both 2.0 by default:
+
+```
+speedup = concurrency x median request latency / batch wall clock
+```
+
+Every level above concurrency 1 must reach that speedup, and no level may
+record an error or a throttle. Level 1 is measured to establish the
+single-request latency, and has no speedup to judge.
+
+An earlier rule compared median request latency to batch wall clock and
+required 0.4. That ratio cannot measure serialization. Batch wall clock is
+bounded below by the slowest request in the batch, while the numerator is the
+median, so the ratio falls as concurrency rises for every backend. Measured
+from one laptop, AWS S3 scored 0.09 at concurrency 256 with zero errors. The
+ratio is still reported, as a latency-spread measurement, and
+`fanout_efficiency_min` still describes it, but it never decides a result.
+
+Batch throughput and its peak are also reported. A peak marks where something
+saturates, which may be the runner rather than the backend.
 
 Missing or invalid measurements cannot pass, and neither can any non-throttle
 error. Conclusions apply only to the concurrency range actually tested.
@@ -137,13 +189,13 @@ equality. Do not read it as a corruption test.
 
 ## The latency reference
 
-Latency criteria compare against AWS S3. There are two ways to supply that
+Latency checks compare against AWS S3. There are two ways to supply that
 comparison, and the report always names which one it used.
 
 **Bundled reference profile (the default).** Most vendors have no AWS account.
 The framework therefore ships the bar it grades against, in
 `config/reference_profiles/`. Select one with `--reference <id>`, give a path
-to your own file, or pass `--reference none` to leave latency criteria
+to your own file, or pass `--reference none` to leave latency checks
 inconclusive.
 
 A profile holds two numbers, not a table of per-operation latencies:
@@ -189,7 +241,7 @@ AWS hostname, completed load status, artifact checksums, a default flavor
 fingerprint, Python and dependency versions, CPU count, architecture, operating
 system, and an explicit runner network location.
 
-Any difference keeps the relative latency criteria inconclusive. The report
+Any difference keeps the relative latency checks inconclusive. The report
 shows the reference identity, dates and settings.
 
 Matching metadata does not prove identical network conditions. Inspect the
@@ -204,7 +256,7 @@ an earlier report. A change is shown only when the endpoint, bucket, region,
 tier, flavor, workload, configuration, requested duration and runner location
 all match. Positive percentages mean latency increased.
 
-History never substitutes for the AWS reference and never changes the verdict.
+History never substitutes for the AWS reference and never changes the result.
 
 ## External compliance evidence
 
@@ -236,14 +288,16 @@ file. This is an operator declaration with attached evidence. The report does
 not parse the suite output and does not re-execute it. Keep the original files
 with the report package.
 
-Raw `warp` reports stay an optional external diagnostic. The report states
+Raw `warp` reports stay optional extra evidence from another tool. The report states
 explicitly when they are absent.
 
 ## Portability and credentials
 
 Manifests use an allowlist of settings. Access keys and secret keys are never
 serialized. Endpoint URLs containing embedded credentials, query strings or
-fragments are rejected. Arbitrary exceptions are recorded by their type only.
+fragments are rejected. When a workload worker stops, its error type and
+message are printed and saved under `worker_errors`, with this run's access
+key, secret key and session token removed from the message first.
 
 The report HTML escapes all dynamic content, sets a restrictive content
 security policy, and uses no content delivery network, remote font or remote
@@ -260,5 +314,5 @@ configuration. They are not imported into certification automatically.
 - Supply the baseline during report generation, not during `load`.
 - The old compatibility `--baseline-out` format was never a performance
   baseline and is no longer used.
-- The legacy Markdown renderer in `src/report.py` remains a diagnostic
+- The legacy Markdown renderer in `src/report.py` stays available as a
   interface. It cannot certify unversioned evidence.

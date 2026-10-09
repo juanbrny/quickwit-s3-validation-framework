@@ -7,7 +7,7 @@ from collections import Counter
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .qw_s3_client import DEFAULT_FLAVORS, same_settings
+from .qw_s3_client import DEFAULT_FLAVORS, flavor_label, same_settings
 from .reference_profile import DEFAULT_PROFILE, describe, load_profile, reference_p99
 from .report import _load_jsonl, _percentile, summarize_ops
 from .run_store import load_bundle, read_json, utc_now, digest
@@ -17,18 +17,50 @@ PASS, FAIL, NOT_RUN, INCONCLUSIVE = "PASS", "FAIL", "NOT RUN", "INCONCLUSIVE"
 # The four questions a reader brings to the report. Every criterion belongs to
 # exactly one of them, so the report can show four roll-up answers instead of
 # one flat list of several dozen equally weighted rows.
+# The five questions in docs/what_this_measures.md, in the same order and the
+# same words. The report and that page must never drift apart. A sixth
+# section covers whether the run itself can be trusted. Its checks never
+# decide the result; they make an affected result inconclusive instead.
 QUESTIONS = [
-    ("evidence", "Can I trust this evidence?",
-     "Whether the run is complete, unchanged and comparable to its reference."),
-    ("behavior", "Does it behave like S3?",
-     "Whether the API semantics Quickwit depends on are correct."),
-    ("capacity", "Can it keep up?",
-     "Whether the endpoint sustains the offered rate without errors or throttling."),
-    ("latency", "Is it fast enough?",
-     "Whether response times stay within the allowed multiple of AWS S3."),
+    ("compatibility", "Does the storage speak S3 the way Quickwit needs?",
+     "The five things Quickwit needs from an S3 interface."),
+    ("concurrency", "Does the storage handle many requests at the same time?",
+     "Whether a group of requests sent together is served together."),
+    ("keeps_up", "Can the storage keep up?",
+     "Whether it sustains the write and search rate the daily volume needs."),
+    ("speed", "Is the storage as fast as AWS S3?",
+     "Whether response times stay under their limit."),
+    ("correctness", "Is the storage correct and stable while busy?",
+     "Failed requests, slowed-down requests, and when new objects appear."),
+    ("trust", "Can we trust this result?",
+     "Information about the run itself. These checks never decide the result."),
 ]
-# Worst first. A group reports the worst status among its required criteria.
+# Worst first. A section reports the worst status among its deciding checks.
 STATUS_ORDER = (FAIL, INCONCLUSIVE, NOT_RUN, PASS)
+
+
+def roll_up(members, missing_expected=False):
+    """One status for a set of per-operation checks.
+
+    Ten checks decide the result. Twenty-one of the old ones were the same
+    three measurements repeated for each operation, which nobody could hold
+    in their head. They are summarized here instead. The per-operation detail
+    stays in the report, in the operations table.
+    """
+    if not members:
+        return NOT_RUN
+    states = {c["status"] for c in members}
+    worst = next((s for s in STATUS_ORDER if s in states), NOT_RUN)
+    # A failure always shows, even when other operations are missing. An
+    # earlier version returned NOT RUN whenever an operation was missing,
+    # which hid real failures and turned NOT CERTIFIED into INCONCLUSIVE.
+    if worst == FAIL:
+        return FAIL
+    # Something was measured, but not everything. That is INCONCLUSIVE, by the
+    # meaning the report gives each word, not NOT RUN.
+    if missing_expected and worst == PASS:
+        return INCONCLUSIVE
+    return worst
 OP_NAMES = {
     "put_object": "Split upload",
     "multipart_upload": "Multipart upload",
@@ -65,8 +97,9 @@ def check(
     explanation,
     action="",
     required=True,
-    group="evidence",
+    group="trust",
     ratio=None,
+    source=None,
 ):
     return dict(
         id=key,
@@ -79,7 +112,94 @@ def check(
         required=required,
         group=group,
         ratio=ratio,
+        # Where this number came from: the command, the evidence file, and
+        # the setting that fixed the limit. So "where does this come from?"
+        # is always answerable from the report itself.
+        source=source or {},
     )
+
+
+# Used for bundles recorded before the serialization band existed. A report
+# normally uses the thresholds saved with its own run, but a band that was not
+# saved has to come from somewhere.
+DEFAULT_MIN_SPEEDUP = 2.0
+
+
+# After a pause, connections must be re-made. A MacBook took 7 seconds to
+# bring its network back after a 99-second sleep, and the next request failed
+# 52 seconds after waking. This much time after each pause is left out too.
+RECOVERY_S = 60.0
+PAUSE_THRESHOLD_S = 5.0
+
+
+# Checks whose result depends on when things happened. A pause of the test
+# machine can make any of them fail without any fault in the storage.
+PER_OPERATION_SUFFIXES = ("_p99", "_errors", "_throttles")
+TIME_BASED = {
+    "throughput", "query_rate", "response_time", "failed_requests",
+    "slowed_requests", "object_visibility",
+}
+
+
+def paused_time(stage):
+    """Seconds this machine was not running during one stage.
+
+    The wall clock keeps counting while a machine sleeps; the process clock
+    does not. Their difference is the time nothing ran.
+    """
+    started, finished = stage.get("started_epoch"), stage.get("finished_epoch")
+    running = stage.get("actual_duration_s")
+    if not _number(running):
+        return 0.0
+    if not _number(finished) and stage.get("started_at") and stage.get("finished_at"):
+        from datetime import datetime
+
+        wall = (
+            datetime.fromisoformat(stage["finished_at"])
+            - datetime.fromisoformat(stage["started_at"])
+        ).total_seconds()
+    elif _number(started) and _number(finished):
+        wall = finished - started
+    else:
+        return 0.0
+    return max(0.0, wall - running)
+
+
+def pause_windows(stage):
+    """When each pause happened, as wall-clock intervals including recovery.
+
+    Returns None when the stage paused but the run predates pause tracking,
+    so nobody can say which minutes were affected.
+    """
+    pauses = stage.get("pauses")
+    if pauses:
+        return [
+            (p["started_epoch"], p["started_epoch"] + p["seconds"] + RECOVERY_S)
+            for p in pauses
+        ]
+    return None if paused_time(stage) > PAUSE_THRESHOLD_S else []
+
+
+def overlaps(begin, end, intervals):
+    return any(begin < b and a < end for a, b in intervals or [])
+
+
+def level_speedup(row):
+    """Speedup for one sweep level, recomputed when the field is absent.
+
+    Older bundles were summarized before `speedup` existed. The inputs are
+    recorded, so the same number can be derived rather than lost.
+    """
+    if _number(row.get("speedup")):
+        return row["speedup"]
+    concurrency, p50, wall = (
+        row.get("concurrency"),
+        row.get("p50_per_request_s"),
+        row.get("wall_clock_s"),
+    )
+    if _number(concurrency) and _number(p50) and _number(wall) and wall > 0:
+        return concurrency * p50 / wall
+    return None
 
 
 def limit_ratio(observed, limit, at_most=True):
@@ -97,9 +217,24 @@ def limit_ratio(observed, limit, at_most=True):
     return limit / observed if observed > 0 else None
 
 
+# Results from other tools that the operator may attach. Most runs never do,
+# so their absence must not make "Can we trust this result?" look like a
+# problem. They are still shown as rows.
+ATTACHED_EVIDENCE = ("compliance", "warp")
+
+
 def group_status(checks, group):
-    """The worst status among one group's required criteria."""
-    states = {c["status"] for c in checks if c["required"] and c["group"] == group}
+    """The worst status in one section.
+
+    Deciding checks set the status. The trust section has none of them, so it
+    reports on its information-only checks instead.
+    """
+    members = [
+        c for c in checks if c["group"] == group and c["id"] not in ATTACHED_EVIDENCE
+    ]
+    states = {c["status"] for c in members if c["required"]} or {
+        c["status"] for c in members
+    }
     for status in STATUS_ORDER:
         if status in states:
             return status
@@ -257,7 +392,14 @@ def build_report(
         raise ValueError("Invalid reporting sample or window policy.")
     load = stages.get("load", {})
     options = load.get("options", {})
-    flavor = options.get("flavor")
+    flavor = options.get("flavor") or next(
+        (
+            record.get("options", {}).get("flavor")
+            for name, record in stages.items()
+            if name != "compat" and record.get("options", {}).get("flavor")
+        ),
+        None,
+    )
     checks, measurements, errors = [], [], []
     # Latency is graded against one of two references. A measured AWS run wins
     # when the operator supplies one. Otherwise the bundled profile applies, so
@@ -276,7 +418,8 @@ def build_report(
         "Unchanged evidence",
         "Checks that measurements match the files recorded when each stage finished.",
         "Restore the original run bundle or run the affected stages in a new directory.",
-        group="evidence",
+        group="trust",
+        required=False,
     )
     for stage in ("compat", "fanout", "put-fanout", "load"):
         record = stages.get(stage, {})
@@ -290,9 +433,20 @@ def build_report(
             "Completed stage",
             "A stopped or failed test is incomplete evidence.",
             f"Run the {stage} stage and record its evidence in a complete run bundle.",
-            group="evidence",
+            group="trust",
+            required=False,
         )
     rows = _rows(path / "ingest_merge.jsonl") + _rows(path / "query.jsonl")
+    paused_s = paused_time(load) if load else 0.0
+    paused_at = pause_windows(load) if load else []
+    if paused_at:
+        # A request that ran across a pause measured the pause, not the
+        # storage: its latency includes the sleep, and its failure is the
+        # broken connection the sleep left behind.
+        rows = [
+            r for r in rows
+            if not overlaps(r["ts"] - r["latency_s"], r["ts"], paused_at)
+        ]
     summary = summarize_ops(rows)
     if rows and not load:
         issues.append("Operation files have no recorded load stage.")
@@ -340,17 +494,26 @@ def build_report(
         reference_state,
         reference_observed,
         "A measured AWS run, or the bundled reference profile",
-        "Latency criteria compare against AWS S3. A measured run is the stronger"
+        "Latency checks compare against AWS S3. A measured run is the stronger"
         " evidence, because it shares this runner and network. The bundled"
         " profile is the published bar, and it applies when no measured run is"
         " supplied.",
         "Supply --baseline with a measured AWS run, or choose a profile with --reference.",
-        group="evidence",
+        group="trust",
+        required=False,
     )
 
     compat = read_json(path / "compat.json") if (path / "compat.json").exists() else {}
     rec = compat.get("recommended_flavor")
-    attempt = compat.get("attempts", {}).get(rec, {})
+    # Grade the settings the run actually used. Usually that is the
+    # recommendation, but an operator may choose other settings with
+    # `certify --flavor`. Grading the recommendation instead would certify
+    # settings nobody measured.
+    used = flavor or rec
+    attempts = compat.get("attempts", {})
+    attempt = attempts.get(used) or next(
+        (a for name, a in attempts.items() if same_settings(name, used)), {}
+    )
     required_compat = stages.get("compat", {}).get(
         "required_checks",
         [
@@ -365,26 +528,46 @@ def build_report(
         attempt.get("results", {}).get(name, {}).get("passed") is True
         for name in required_compat
     )
+    results = attempt.get("results", {})
+    # A check that ran and failed is a failure. A check with no result is
+    # missing evidence, which is inconclusive, never a failure and never a pass.
+    failed_compat = [
+        name for name in required_compat if results.get(name, {}).get("passed") is False
+    ]
     compat_status = (
         PASS
         if compatibility_ok
-        else INCONCLUSIVE
-        if rec
         else FAIL
-        if compat.get("attempts")
+        if failed_compat or (attempts and not rec and not results)
+        else INCONCLUSIVE
+        if results or rec
         else NOT_RUN
     )
+    if used and attempt.get("results"):
+        compat_seen = f"{flavor_label(used)}: " + (
+            "every check passed" if compatibility_ok else "some checks failed"
+        )
+        if rec and not same_settings(rec, used):
+            compat_seen += f". The mildest settings that work are {flavor_label(rec)}."
+    elif rec:
+        compat_seen = f"Recommended: {flavor_label(rec)}"
+    else:
+        compat_seen = "No working flavor recorded"
     add(
         "compatibility",
         "S3 compatibility",
         compat_status,
-        f"Recommended flavor: {rec}" if rec else "No working flavor recorded",
+        compat_seen,
         "All compatibility checks pass",
         "Tests the S3 behavior exercised by Quickwit's storage settings.",
         "Inspect the flavor comparison and failing check details.",
-        group="behavior",
+        group="compatibility",
+        source={"command": "compat", "evidence": "compat.json"},
     )
-    matching = same_settings(rec, flavor)
+    # Every measured stage must use one set of settings, and those settings
+    # must have passed compatibility. Matching the recommendation is not the
+    # point; an operator may choose other settings that also work.
+    matching = flavor is not None and compatibility_ok
     for stage in ("fanout", "put-fanout"):
         if stage in stages and not same_settings(
             stages[stage].get("options", {}).get("flavor"), flavor
@@ -394,11 +577,12 @@ def build_report(
         "flavor",
         "Configuration used for testing",
         PASS if matching else INCONCLUSIVE,
-        f"Load: {flavor or 'not recorded'}; recommended: {rec or 'not recorded'}",
-        "The compatibility recommendation and all three measured stages used the same flavor",
+        f"Used: {flavor_label(flavor)}; recommended: {flavor_label(rec)}",
+        "All three measured steps used the same settings, and those settings passed compatibility",
         "A passing result under one configuration does not certify a different configuration.",
-        "Repeat performance stages with the recommended flavor in a new run bundle.",
-        group="evidence",
+        "Run again with one set of settings that passes compatibility, in a new run directory.",
+        group="trust",
+        required=False,
     )
 
     start = load.get("measurement_started_epoch", load.get("started_epoch", 0))
@@ -412,18 +596,22 @@ def build_report(
         mix.get("avg_s3_mbps", 0),
         mix.get("query_qps", 0),
     )
-    full = [w for w in windows if w["complete"]]
+    for w in windows:
+        w["paused"] = bool(paused_at) and overlaps(
+            start + w["offset_s"], start + w["offset_s"] + w["duration_s"], paused_at
+        )
+    full = [w for w in windows if w["complete"] and not w["paused"]]
     sufficient = len(full) >= min_windows
     for key, title, field, requirement in (
         (
             "throughput",
-            "Sustained original ingestion",
+            "Keeps up with writes",
             "ingest_pct",
             bands["sustained_throughput_min_pct_of_target"],
         ),
         (
             "query_rate",
-            "Sustained simulated query rate",
+            "Keeps up with searches",
             "query_qps",
             mix.get("query_qps", 0)
             * bands["sustained_throughput_min_pct_of_target"]
@@ -447,28 +635,38 @@ def build_report(
             else FAIL
         )
         unit = "% of target" if key == "throughput" else " queries/s"
+        if observed is None:
+            seen = "No complete 60-second window"
+        else:
+            seen = f"Worst complete window: {observed:.2f}{unit}"
+            if not sufficient:
+                seen += f" (only {len(full)} of {min_windows} needed windows)"
         add(
             key,
             title,
             state,
-            f"Worst complete window: {observed:.2f}{unit}"
-            if observed is not None
-            else "No complete measurement windows",
+            seen,
             f"At least {requirement:.2f}{'% of target' if key == 'throughput' else ' queries/s'} in every {seconds}s complete window",
-            f"Requires {min_windows} complete windows. Ingestion counts successful original indexer writes only; merge rewrites are excluded. Partial final windows are displayed but not gated.",
+            f"Requires {min_windows} complete windows. Ingestion counts successful original indexer writes only; merge rewrites are excluded. A partial last window is shown, but does not count.",
             "Check the timeline for stalls and verify that the load generator can sustain the requested rate.",
-            group="capacity",
+            group="keeps_up",
+            source={
+                "command": "load",
+                "evidence": "ingest_merge.jsonl" if key == "throughput" else "query.jsonl",
+                "setting": "sustained_throughput_min_pct_of_target",
+            },
             ratio=limit_ratio(observed, requirement, at_most=False),
         )
     add(
         "merge_backlog",
-        "Merge backlog growth",
+        "Merge backlog",
         NOT_RUN,
         "No independent merge queue is measured",
         "Flat or decreasing backlog under sustained offered ingestion",
-        "Merges run synchronously inside indexer workers. This simulation cannot establish the documented merge-backlog criterion.",
+        "Merges run synchronously inside indexer workers. This simulation cannot establish the documented merge-backlog check.",
         "Instrument an independently scheduled merger before claiming full tier certification.",
-        group="capacity",
+        group="keeps_up",
+        source={"command": "load", "evidence": "not measured yet"},
     )
 
     expected_groups = [
@@ -481,6 +679,7 @@ def build_report(
     ]
     if any(p.get("docs_returned", 0) > 0 for p in cfg.get("query_profiles", [])):
         expected_groups.append(("get_doc",))
+    uncovered = [g for g in expected_groups if not any(op in summary for op in g)]
     for group in expected_groups:
         if not any(op in summary for op in group):
             add(
@@ -491,7 +690,8 @@ def build_report(
                 "At least one applicable operation measured",
                 "A missing operation is not a passing operation.",
                 "Run long enough to exercise ingestion, queries, merges and garbage collection.",
-                group="capacity",
+                group="correctness",
+                required=False,
             )
     for op, raw in summary.items():
         title = OP_NAMES.get(op, op)
@@ -556,7 +756,8 @@ def build_report(
             op + "_p99",
             title + " p99",
             state,
-            f"{raw['p99_latency_s'] * 1000:.1f} ms; n={raw['count']}",
+            f"{raw['p99_latency_s'] * 1000:.1f} ms; n={raw['count']}"
+            + (f" (needs {minimum})" if raw["count"] < minimum else ""),
             f"≤ {multiplier:g}× AWS"
             + (
                 f" = {limit * 1000:.1f} ms"
@@ -565,7 +766,8 @@ def build_report(
             ),
             explanation,
             "Check sample counts and baseline comparability, then inspect concurrency and backend contention.",
-            group="latency",
+            group="speed",
+            required=False,
             ratio=limit_ratio(raw["p99_latency_s"], limit),
         )
         error_check = add(
@@ -578,7 +780,8 @@ def build_report(
             f"≤ {bands['error_rate_max_pct']}% non-throttle errors",
             "Throttling is evaluated separately. Rates describe final client outcomes after retries, not all wire attempts.",
             "Inspect the error codes and compatibility settings.",
-            group="capacity",
+            group="correctness",
+            required=False,
             ratio=limit_ratio(
                 raw["non_throttle_error_pct"], bands["error_rate_max_pct"]
             ),
@@ -611,7 +814,8 @@ def build_report(
             f"Worst window ≤ {bands['throttle_rate_sustained_max_pct']}%; median window 0%",
             "Evaluated in complete time windows with samples; empty operation windows are excluded, and coverage is checked separately.",
             "Inspect throttling and connection limits during the affected intervals.",
-            group="capacity",
+            group="correctness",
+            required=False,
             ratio=limit_ratio(worst, bands["throttle_rate_sustained_max_pct"]),
         )
         measurements.append(
@@ -639,7 +843,81 @@ def build_report(
         ).most_common():
             errors.append(dict(operation=title, code=code, count=count))
 
+    # Three checks replace twenty-one. Each one fails when any operation in it
+    # fails, so no detail is lost from the result, only from the reading.
+    for key, title, suffix, explanation, action, setting in (
+        (
+            "response_time",
+            "Response time",
+            "_p99",
+            "The time 99 out of 100 requests beat, for every operation, against"
+            " its own limit. The operations table lists each one.",
+            "Open the operations table and start with the operation furthest past its limit.",
+            "put_p99_multiplier_vs_aws, and the other p99 multipliers",
+        ),
+        (
+            "failed_requests",
+            "Failed requests",
+            "_errors",
+            "The share of requests that failed, for every operation. Throttled"
+            " requests are counted separately.",
+            "Open the operations table, then check the error codes listed below it.",
+            "error_rate_max_pct",
+        ),
+        (
+            "slowed_requests",
+            "Slowed-down requests",
+            "_throttles",
+            "The share of requests the storage asked us to retry, for every"
+            " operation, in each full minute.",
+            "Check the request limits on the storage system during the affected minutes.",
+            "throttle_rate_sustained_max_pct",
+        ),
+    ):
+        members = [c for c in checks if c["id"].endswith(suffix) and c["group"] != "trust"]
+        failing = [c for c in members if c["status"] not in (PASS,)]
+        status = roll_up(members, missing_expected=bool(uncovered))
+        # Count each outcome separately. "Did not pass" lumped failures with
+        # operations that were only too short to judge, and read as failure.
+        tally = Counter(c["status"] for c in members)
+        words = {FAIL: "failed", INCONCLUSIVE: "not enough data", PASS: "passed"}
+        parts = [
+            f"{tally[state]} {words[state]}"
+            for state in (FAIL, INCONCLUSIVE, PASS)
+            if tally.get(state)
+        ]
+        observed = f"Of {len(members)} operations: " + ", ".join(parts)
+        if uncovered:
+            observed += "; never ran: " + ", ".join(OP_NAMES[g[0]] for g in uncovered)
+        add(
+            key,
+            title,
+            status,
+            observed,
+            "Every measured operation stays within its limit",
+            explanation,
+            action,
+            group="speed" if suffix == "_p99" else "correctness",
+            source={
+                "command": "load",
+                "evidence": "ingest_merge.jsonl and query.jsonl",
+                "setting": setting,
+            },
+            ratio=max(
+                (c["ratio"] for c in members if _number(c.get("ratio"))), default=None
+            ),
+        )
+
     consistency = _load_jsonl(path / "consistency.jsonl")
+    if paused_at:
+        consistency = [
+            r for r in consistency
+            if not (
+                _number(r.get("ts"))
+                and _number(r.get("elapsed_s"))
+                and overlaps(r["ts"] - r["elapsed_s"], r["ts"], paused_at)
+            )
+        ]
     consistency_summary = []
     for probe, title in PROBES.items():
         subset = [r for r in consistency if r.get("probe") == probe]
@@ -673,7 +951,8 @@ def build_report(
             f"{bands['consistency_probe_min_success_pct']}% within {bands['consistency_probe_deadline_s']} s",
             "Each probe performs an immediate follow-up operation; the deadline covers the complete probe, not repeated polling until visible.",
             "Inspect failed probe details and object visibility behavior.",
-            group="behavior",
+            group="correctness",
+            required=False,
             ratio=limit_ratio(
                 percent, bands["consistency_probe_min_success_pct"], at_most=False
             ),
@@ -691,6 +970,28 @@ def build_report(
             )
         )
 
+    probes = [c for c in checks if c["id"] in PROBES]
+    failing = [c for c in probes if c["status"] != PASS]
+    add(
+        "object_visibility",
+        "Objects appear at once",
+        roll_up(probes),
+        f"{len(probes) - len(failing)} of {len(probes)} checks passed"
+        if probes
+        else "No visibility checks recorded",
+        "A new object is readable, listed and gone when it should be",
+        "After a write, a list or a delete, we immediately look again. Quickwit"
+        " assumes the change is already visible.",
+        "Open the three visibility checks below for the failing one.",
+        group="correctness",
+        source={
+            "command": "load",
+            "evidence": "consistency.jsonl",
+            "setting": "consistency_probe_min_success_pct",
+        },
+        ratio=min((c["ratio"] for c in probes if _number(c.get("ratio"))), default=None),
+    )
+
     sweeps = {}
     for stage, title, key in (
         ("fanout", "Read concurrency", "fanout"),
@@ -699,7 +1000,9 @@ def build_report(
         file = path / (stage + ".json")
         sweep = read_json(file) if file.exists() else {}
         levels = sweep.get("levels", [])
-        floor = bands[key + "_efficiency_min"]
+        required_speedup = bands.get(
+            key + "_serialization_min_speedup", DEFAULT_MIN_SPEEDUP
+        )
         expected = stages.get(stage, {}).get(
             "tested_levels", bands[key + "_concurrency_levels"]
         )
@@ -708,47 +1011,73 @@ def build_report(
             and {r.get("concurrency") for r in levels} == set(expected)
             and any(k > 1 for k in expected)
         )
+        # The gate is serialization, not latency spread. A backend that serves
+        # concurrent requests one at a time shows a speedup near 1 whatever
+        # the client offers. Errors and throttles still fail outright.
         bad = [
             r
             for r in levels
             if r.get("error_count", 0)
             or r.get("throttle_count", 0)
-            or (_number(r.get("efficiency")) and r["efficiency"] < floor)
+            or (
+                r.get("concurrency", 1) > 1
+                and (
+                    not _number(level_speedup(r))
+                    or level_speedup(r) < required_speedup
+                )
+            )
         ]
         if any(
-            not _number(r.get("efficiency"))
-            or not _number(r.get("wall_clock_s"))
-            or r["wall_clock_s"] <= 0
-            for r in levels
+            not _number(r.get("wall_clock_s")) or r["wall_clock_s"] <= 0 for r in levels
         ):
             valid = False
         state = (
             NOT_RUN if not sweep else FAIL if bad else PASS if valid else INCONCLUSIVE
         )
+        measured = sweep.get("min_speedup")
+        if not _number(measured):
+            measured = min(
+                (
+                    value
+                    for value in (
+                        level_speedup(r) for r in levels if r.get("concurrency", 1) > 1
+                    )
+                    if _number(value)
+                ),
+                default=None,
+            )
         add(
             stage + "_efficiency",
-            title + " sweep",
+            title,
             state,
-            "Failed at concurrency " + ", ".join(str(r["concurrency"]) for r in bad)
+            "Served requests one at a time at concurrency "
+            + ", ".join(str(r["concurrency"]) for r in bad)
             if bad
-            else f"{len(levels)} levels measured",
-            f"Efficiency ≥ {floor:g}; zero errors and throttles at every tested level",
-            "Efficiency is typical request latency divided by batch wall-clock time. The median-duration trial is retained; results apply only to the listed concurrency range.",
-            "Inspect latency and errors at each concurrency level; consider both runner and backend limits.",
-            group="capacity",
-            ratio=limit_ratio(
-                min(
-                    (r["efficiency"] for r in levels if _number(r.get("efficiency"))),
-                    default=None,
-                ),
-                floor,
-                at_most=False,
-            ),
+            else f"{len(levels)} levels measured; worst speedup "
+            + (f"{measured:.1f}x" if _number(measured) else "not measured"),
+            f"Speedup of at least {required_speedup:g}x at every level above 1,"
+            " with no errors or throttles",
+            "Speedup is how many requests' worth of latency the batch absorbed"
+            " at once. About 1 means the backend served them one after another."
+            " About the concurrency level means it served them together. Batch"
+            " throughput peaks where something saturates, and that may be this"
+            " runner rather than the backend.",
+            "Compare the speedup curve against the throughput peak, and check"
+            " whether the runner's own network or CPU was the limit.",
+            group="concurrency",
+            source={
+                "command": "read-concurrency" if stage == "fanout" else "write-concurrency",
+                "evidence": stage + ".json",
+                "setting": key + "_serialization_min_speedup",
+            },
+            ratio=limit_ratio(measured, required_speedup, at_most=False),
         )
         sweeps[stage] = {
             **sweep,
             "status": state,
-            "efficiency_floor": floor,
+            "min_speedup": measured,
+            "min_speedup_required": required_speedup,
+            "efficiency_floor": bands.get(key + "_efficiency_min"),
             "options": stages.get(stage, {}).get("options", {}),
         }
 
@@ -806,20 +1135,40 @@ def build_report(
         "Zero failures or omissions in the relevant multipart, range, delete and list subset",
         "Operator-supplied evidence from s3-tests or mint; raw evidence is fingerprinted, not independently re-executed by the report.",
         "Supply a compliance evidence manifest with --compliance; see docs/measurement_policy.md.",
-        group="behavior",
+        group="trust",
+        required=False,
     )
     add(
         "warp",
         "Raw throughput cross-check",
         NOT_RUN,
         "External warp results are not imported",
-        "Optional diagnostic",
+        "Information only",
         "A raw benchmark can distinguish general storage limits from workload-specific effects.",
         required=False,
-        group="evidence",
+        group="trust",
     )
 
     history = None
+    if paused_at is None:
+        for c in checks:
+            time_based = c["id"] in TIME_BASED or c["id"].endswith(PER_OPERATION_SUFFIXES)
+            if c["status"] == FAIL and time_based:
+                c["status"] = INCONCLUSIVE
+                c["observed"] += (
+                    f" (this machine stopped for {paused_s:.0f} s at an unknown"
+                    " moment, so this cannot be judged)"
+                )
+        # The operations table copies each status; keep it in step.
+        by_id = {c["id"]: c["status"] for c in checks}
+        for m in measurements:
+            for field, suffix in (
+                ("latency_status", "_p99"),
+                ("error_status", "_errors"),
+                ("throttle_status", "_throttles"),
+            ):
+                m[field] = by_id.get(m["op"] + suffix, m[field])
+            m["status"] = m["latency_status"]
     verdict = overall(checks, flavor)
     indexed = {c["id"]: c for c in checks}
     # Say once, in plain words, what this report cannot conclude. These used to
@@ -831,11 +1180,127 @@ def build_report(
             {
                 "title": "Full tier certification is not available yet",
                 "detail": "Merge backlog has no measurement in this simulator, and"
-                " it is a required criterion. The overall result can therefore"
+                " it is a required check. The overall result can therefore"
                 " reach INCONCLUSIVE at best, never CERTIFIED, however well the"
-                " endpoint performs. Every other criterion is measured, and a"
+                " endpoint performs. Every other check is measured, and a"
                 " failure in any of them is still a real failure.",
             }
+        )
+    ran = [s for s in ("compat", "fanout", "put-fanout", "load") if s in stages]
+    if len(ran) < 4:
+        headline_limits.insert(
+            0,
+            {
+                "title": f"Only {len(ran)} of the 4 stages ran",
+                "detail": "This report covers "
+                + ", ".join(STAGE_NAMES[s] for s in ran)
+                + ". Everything the missing stages would measure reads NOT RUN"
+                " below, which is not a pass and not a failure. Run the"
+                " remaining stages into the same run directory, or use"
+                " `certify` to run all of them in order.",
+            },
+        )
+    if paused_s > PAUSE_THRESHOLD_S:
+        headline_limits.insert(
+            0,
+            {
+                "title": f"The test machine stopped for {paused_s:.0f} seconds",
+                "detail": "The computer running the test went to sleep or was"
+                " suspended. Nothing was measured during that time, and the"
+                " open connections broke. "
+                + (
+                    "The report leaves out that time and the following minute,"
+                    " so the storage is not blamed for it."
+                    if paused_at
+                    else "This run was recorded before the tool tracked when a"
+                    " pause happens, so the report cannot tell which minutes it"
+                    " affected. Checks that depend on time read INCONCLUSIVE"
+                    " instead of FAIL."
+                )
+                + " The tool now keeps a Mac awake during a run. On other"
+                " systems, make sure the machine cannot sleep.",
+            },
+        )
+    # A short run leaves checks unanswered for reasons that are arithmetic, not
+    # faults. Say so first, in numbers, so nobody hunts for a problem.
+    if load.get("status") == "COMPLETED":
+        constants = cfg.get("model_constants", {})
+        nodes = max(1, mix.get("num_indexer_nodes", 1))
+        merge_minutes = math.ceil(
+            constants.get("merge_factor", 10)
+            * constants.get("commit_timeout_s", 60)
+            / 60
+            / nodes
+        )
+        needed = max(merge_minutes + 5, min_windows * seconds / 60)
+        ran = duration / 60
+        uploads = sum(
+            summary.get(op, {}).get("count", 0) for op in ("put_object", "multipart_upload")
+        )
+        if ran < needed:
+            reasons = []
+            if len(full) < min_windows:
+                reasons.append(
+                    f"the rate checks need {min_windows} full minutes, and got {len(full)}"
+                )
+            if "get_object_full" not in summary:
+                reasons.append(
+                    f"a merge needs {constants.get('merge_factor', 10)} uploaded files,"
+                    f" and this run uploaded {uploads}, so no merge and no merge"
+                    " delete happened"
+                )
+            thin = [
+                OP_NAMES.get(op, op)
+                for op, raw in summary.items()
+                if raw["count"] < minimum
+            ]
+            if thin:
+                reasons.append(
+                    f"each operation needs {minimum} samples, and "
+                    + ", ".join(thin)
+                    + " got fewer"
+                )
+            # A short run that still answered every check needs no warning.
+            if reasons:
+                headline_limits.insert(
+                    0,
+                    {
+                        "title": "This run was too short to judge"
+                        f" ({ran:g} minute{'' if ran == 1 else 's'})",
+                        "detail": "Many checks read NOT RUN or INCONCLUSIVE for"
+                        " that reason alone: " + "; ".join(reasons) + "."
+                        f" Run for at least {math.ceil(needed)} minutes at this"
+                        " daily volume to answer every check that can be measured.",
+                    },
+                )
+    # Over plain HTTP the client sends an upload checksum as an ordinary
+    # header. Over HTTPS it sends it as a trailer after the body, with an
+    # `x-amz-trailer` header that some storage systems reject; StorageGRID
+    # lists it as unsupported. So an HTTP run can pass compatibility with
+    # settings that would fail in production over HTTPS.
+    effective = load.get("effective_config") or next(
+        (r.get("effective_config") for r in stages.values() if r.get("effective_config")),
+        {},
+    )
+    if urlsplit(manifest["identity"]["endpoint"]).scheme == "http":
+        trailer_risk = effective.get("checksum_algorithm", "crc32c") == "crc32c"
+        headline_limits.insert(
+            0,
+            {
+                "title": "This run used plain HTTP, not HTTPS",
+                "detail": (
+                    "Over HTTP, uploads send their checksum as an ordinary"
+                    " header. Over HTTPS they send it after the body, with an"
+                    " x-amz-trailer header that some storage systems reject."
+                    " So the compatibility result may not hold over HTTPS."
+                    if trailer_risk
+                    else "These settings send checksums the same way over HTTP"
+                    " and HTTPS, so compatibility holds either way."
+                )
+                + " HTTP also skips the cost of encryption, so response times"
+                " can look better than in production. Run over HTTPS, with"
+                " --ca-bundle if needed, to test what production uses.",
+            },
         )
     if profile:
         headline_limits.append(
@@ -907,6 +1372,20 @@ def build_report(
                         * (m["p99_latency_s"] / old[m["op"]]["p99_latency_s"] - 1),
                     }
                 )
+    # Most important first: why the run itself is unreliable, then why it is
+    # incomplete, then how far its results carry.
+    order = (
+        "The test machine stopped",
+        "Only ",
+        "This run was too short",
+        "This run used plain HTTP",
+    )
+    headline_limits.sort(
+        key=lambda h: next(
+            (i for i, prefix in enumerate(order) if h["title"].startswith(prefix)),
+            len(order),
+        )
+    )
     return {
         "schema_version": 1,
         "kind": "quickwit-report",
@@ -926,10 +1405,21 @@ def build_report(
                 "question": question,
                 "summary": summary,
                 "status": group_status(checks, key),
+                # Deciding checks when the section has them, otherwise every
+                # check in it, so the trust section still reports something.
                 "counts": dict(
                     Counter(
-                        c["status"] for c in checks if c["required"] and c["group"] == key
+                        c["status"]
+                        for c in checks
+                        if c["group"] == key
+                        and c["id"] not in ATTACHED_EVIDENCE
+                        and (c["required"] or not any(
+                            m["required"] for m in checks if m["group"] == key
+                        ))
                     )
+                ),
+                "decides_result": any(
+                    c["required"] for c in checks if c["group"] == key
                 ),
             }
             for key, question, summary in QUESTIONS
@@ -953,6 +1443,6 @@ def build_report(
             "Merged synthetic payloads are capped at 160 MB to limit test cost. Real mature splits reach 8-10 GB, so production-size merge throughput is not demonstrated.",
             "Ingestion is expressed in MiB/s of successful original writes. Raw-log equivalents use the configured compression assumption.",
             "Read-after-write currently verifies returned byte length, not full payload equality; it is not a corruption test.",
-            "Partial final windows are shown but excluded from sustained-rate and throttle gates.",
+            "A partial last window is shown, but does not count toward the rate and throttling checks.",
         ],
     }

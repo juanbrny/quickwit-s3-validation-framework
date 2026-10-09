@@ -1,4 +1,4 @@
-# Throughput tiers and the model constants behind docs/03_throughput_tier_sizing.md
+# Throughput tiers and the model constants behind docs/background/03_throughput_tier_sizing.md
 # All GB below are GiB-equivalent (1024-based) to match Quickwit's own docs.
 
 model_constants:
@@ -80,14 +80,19 @@ pass_fail_bands:
   sustained_throughput_min_pct_of_target: 95.0
   consistency_probe_min_success_pct: 100.0
   consistency_probe_deadline_s: 30   # must match default polling_interval
-  fanout_efficiency_min: 0.4   # see concurrency_fanout.py -- below this, "concurrent"
-                               # requests are effectively being serialized somewhere
-                               # in the path and the backend fails the fan-out sweep
+  # The sweep gate: a backend that serves concurrent requests one at a time
+  # shows a speedup near 1 at every level. Both AWS S3 and the vendors measured
+  # so far stay far above 2, so this cleanly separates serialization from
+  # ordinary queueing. See concurrency_fanout.py's FanoutLevelResult.speedup.
+  fanout_serialization_min_speedup: 2.0
+  put_fanout_serialization_min_speedup: 2.0
+  # Diagnostic only, not a gate. Median request latency over batch wall clock.
+  # It falls as concurrency rises for every backend, because wall clock tracks
+  # the slowest request in the batch while this ratio uses the median. AWS S3
+  # scored 0.09 here at concurrency 256 with zero errors, so it must never gate.
+  fanout_efficiency_min: 0.4
   fanout_concurrency_levels: [1, 8, 16, 32, 64, 128, 256, 512, 1024]
-  put_fanout_efficiency_min: 0.4   # see put_fanout.py -- same interpretation as
-                                    # fanout_efficiency_min, applied to concurrent
-                                    # independent PUTs (indexer commits) instead of
-                                    # concurrent range-GETs (queries)
+  put_fanout_efficiency_min: 0.4   # the same diagnostic, for concurrent PUTs
   put_fanout_concurrency_levels: [1, 8, 16, 32, 64, 128]
 
 # Snapshotted with each run; changing this file cannot change old reports.

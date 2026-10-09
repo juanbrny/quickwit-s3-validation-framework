@@ -56,9 +56,9 @@ from pathlib import Path
 from typing import Optional
 
 import aioboto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
-from .qw_s3_client import QwS3Client, QwS3Config, boto_config
+from .qw_s3_client import QwS3Client, QwS3Config, boto_config, connection_failure
 from .report import _percentile
 
 DEFAULT_CONCURRENCY_LEVELS = [1, 8, 16, 32, 64, 128, 256, 512, 1024]
@@ -86,14 +86,40 @@ class FanoutLevelResult:
         return _percentile(self.per_request_latencies_s, 99)
 
     @property
-    def efficiency(self) -> float:
+    def speedup(self) -> float:
+        """How many requests' worth of latency the batch absorbed at once.
+
+        About 1 means the backend served the batch one request at a time,
+        however many the client offered. About `concurrency` means it served
+        them all at once. This is the measurement that answers the question
+        the sweep exists to ask.
+
+        It replaces an earlier `efficiency` ratio of median latency to batch
+        wall clock, which could not answer that question. Wall clock is
+        bounded below by the *slowest* request in the batch, while the
+        numerator was the *median*, so the ratio fell as concurrency rose for
+        any backend, including AWS S3. Measured from one laptop, AWS S3
+        scored 0.09 at concurrency 256 with zero errors, and a 0.4 floor
+        therefore failed the reference implementation.
         """
-        1.0 = ideal: wall-clock for the whole concurrent batch is no worse
-        than a single request's typical latency (the backend fully
-        parallelized the batch).
-        Approaching 0 (specifically 1/concurrency in the fully-serialized
-        case) = the backend processed the "concurrent" requests one at a
-        time despite the client offering them all at once.
+        if self.wall_clock_s <= 0 or not self.per_request_latencies_s:
+            return float("nan")
+        return self.concurrency * self.p50_per_request_s / self.wall_clock_s
+
+    @property
+    def requests_per_s(self) -> float:
+        """Batch throughput. Its peak across the sweep is where something
+        saturates, which may be the runner rather than the backend."""
+        if self.wall_clock_s <= 0:
+            return float("nan")
+        return self.concurrency / self.wall_clock_s
+
+    @property
+    def efficiency(self) -> float:
+        """Median request latency over batch wall clock, kept as a diagnostic.
+
+        It shows how far latency spreads within a batch. It is not a
+        serialization test, and nothing gates on it. See `speedup`.
         """
         if self.wall_clock_s <= 0 or not self.per_request_latencies_s:
             return float("nan")
@@ -123,6 +149,7 @@ def _async_client_kwargs(cfg: QwS3Config, top_concurrency: int) -> dict:
         endpoint_url=cfg.endpoint_url,
         aws_access_key_id=cfg.access_key,
         aws_secret_access_key=cfg.secret_key,
+        aws_session_token=cfg.session_token,
         region_name=cfg.region,
         config=boto_cfg,
         verify=cfg.verify_tls,
@@ -140,6 +167,10 @@ async def _get_range_async(s3_client, bucket: str, key: str, start: int, end: in
     except ClientError as e:
         return {"ok": False, "op": "get_object_range", "latency_s": time.perf_counter() - t0,
                 "error": e.response.get("Error", {}).get("Code", str(e))}
+    except (BotoCoreError, OSError) as e:
+        # A dropped connection counts as an error at this level. Running out
+        # of open files stops the sweep instead; see connection_failure().
+        return connection_failure("get_object_range", t0, e)
 
 
 async def _run_one_level(s3_client, bucket: str, key: str, obj_size: int, k: int) -> FanoutLevelResult:
@@ -224,32 +255,65 @@ def run_fanout_sweep(cfg: QwS3Config, bucket: str, key: str, obj_size: int,
     return asyncio.run(_run_fanout_sweep_async(cfg, bucket, key, obj_size, concurrency_levels, repeats))
 
 
-def summarize_fanout(results: list, efficiency_floor: float = 0.4) -> dict:
+def summarize_fanout(results: list, efficiency_floor: float = 0.4,
+                      min_speedup: float = 2.0) -> dict:
     """
-    Finds the concurrency level (if any) at which the backend stops
-    sustaining the fan-out -- i.e., where efficiency drops below
-    efficiency_floor or throttling appears. That's the point past which
-    this backend can no longer hide S3-style per-request latency behind
-    concurrency the way the architecture needs it to, at least on this
-    connection.
+    Answers one question: does the backend serve concurrent requests at the
+    same time, or one after another?
+
+    A backend that serializes shows a speedup near 1 at every level, however
+    many requests the client offers. Both AWS S3 and the vendors measured so
+    far stay far above that. The summary also records where batch throughput
+    peaks, which is where something saturates -- possibly the runner, not the
+    backend -- and keeps the older efficiency ratio as a diagnostic.
     """
     rows = []
+    serializes_at = None
     degrades_at = None
     for r in results:
-        eff = r.efficiency
+        eff, speedup, rate = r.efficiency, r.speedup, r.requests_per_s
         rows.append({
             "concurrency": r.concurrency,
             "wall_clock_s": r.wall_clock_s if math.isfinite(r.wall_clock_s) else None,
             "p50_per_request_s": r.p50_per_request_s if math.isfinite(r.p50_per_request_s) else None,
             "p99_per_request_s": r.p99_per_request_s if math.isfinite(r.p99_per_request_s) else None,
             "efficiency": eff if math.isfinite(eff) else None,
+            "speedup": speedup if math.isfinite(speedup) else None,
+            "requests_per_s": rate if math.isfinite(rate) else None,
             "error_count": r.error_count,
             "throttle_count": r.throttle_count,
         })
-        if degrades_at is None:
-            if r.error_count > 0 or r.throttle_count > 0 or not math.isfinite(eff) or eff < efficiency_floor:
-                degrades_at = r.concurrency
-    return {"levels": rows, "degrades_at_concurrency": degrades_at, "efficiency_floor": efficiency_floor}
+        # An error or a throttle fails any level, including the first. Speedup
+        # is only judged above concurrency 1, because one request cannot run
+        # in parallel with itself; that level exists to establish the
+        # single-request latency.
+        failed = bool(r.error_count or r.throttle_count) or (
+            r.concurrency > 1
+            and (not math.isfinite(speedup) or speedup < min_speedup)
+        )
+        if serializes_at is None and failed:
+            serializes_at = r.concurrency
+        if degrades_at is None and (not math.isfinite(eff) or eff < efficiency_floor):
+            degrades_at = r.concurrency
+    rates = [row["requests_per_s"] for row in rows if row["requests_per_s"]]
+    peak = max(rates) if rates else None
+    return {
+        "levels": rows,
+        "serializes_at_concurrency": serializes_at,
+        "min_speedup": min(
+            (row["speedup"] for row in rows
+             if row["concurrency"] > 1 and row["speedup"] is not None),
+            default=None,
+        ),
+        "min_speedup_required": min_speedup,
+        "peak_requests_per_s": peak,
+        "peak_at_concurrency": next(
+            (row["concurrency"] for row in rows if row["requests_per_s"] == peak), None
+        ),
+        # Diagnostic only. Nothing gates on these two.
+        "degrades_at_concurrency": degrades_at,
+        "efficiency_floor": efficiency_floor,
+    }
 
 
 def render_fanout_markdown(summary: dict, out_path: Path):

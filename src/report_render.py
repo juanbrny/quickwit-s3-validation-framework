@@ -10,6 +10,7 @@ import shutil
 from collections import Counter
 from pathlib import Path
 
+from .qw_s3_client import flavor_label
 from .run_store import write_json
 
 
@@ -54,7 +55,22 @@ def _reference_label(report):
             f"Reference profile {profile['id']} v{profile['version']}"
             f" ({profile.get('status', 'published')})"
         )
-    return "None; latency criteria are inconclusive"
+    return "None, so the response time check is inconclusive"
+
+
+def source_line(check):
+    """Where this number came from: command, evidence file, setting."""
+    source = check.get("source") or {}
+    parts = [
+        f"{label} <code>{esc(source[key])}</code>"
+        for key, label in (
+            ("command", "command"),
+            ("evidence", "evidence"),
+            ("setting", "setting"),
+        )
+        if source.get(key)
+    ]
+    return '<p class="source">From ' + ", ".join(parts) + ".</p>" if parts else ""
 
 
 def ratio_cell(value):
@@ -176,13 +192,13 @@ def render_html(report, links=None):
             '<div class="sample"><strong>Illustrative report.</strong> Synthetic data demonstrates the layout; these are not vendor measurements.</div>'
         )
     explanation = {
-        "INCONCLUSIVE": "The evidence is incomplete. Review the missing or inconclusive criteria below before making a certification decision.",
+        "INCONCLUSIVE": "The evidence is incomplete. Read the checks below that are not measured, or not measured enough.",
         "NOT CERTIFIED": "One or more required checks failed. The detailed results explain the measured gaps and what to investigate.",
         "CERTIFIED": "Every required criterion passed with the default configuration.",
         "CERTIFIED WITH DEVIATION": "Every required criterion passed with the configuration recorded below.",
     }[report["verdict"]]
     parts.append(
-        f'<header class="hero"><div class="eyebrow">Quickwit · Storage validation</div><h1>S3 compatibility &amp; performance</h1><p>{esc(run["identity"]["endpoint"])} · {esc(report["tier"])} tier · actual flavor: <strong>{esc(report["flavor"])}</strong></p><div class="verdict">{esc(report["verdict"])}</div><p>{explanation}</p><div class="stats">'
+        f'<header class="hero"><div class="eyebrow">Quickwit · Storage validation</div><h1>S3 compatibility &amp; performance</h1><p>{esc(run["identity"]["endpoint"])} · {esc(report["tier"])} tier · settings: <strong>{esc(flavor_label(report["flavor"]))}</strong></p><div class="verdict">{esc(report["verdict"])}</div><p>{explanation}</p><div class="stats">'
     )
     for state in ("PASS", "FAIL", "INCONCLUSIVE", "NOT RUN"):
         parts.append(
@@ -226,15 +242,16 @@ def render_html(report, links=None):
         )
         if len(attention) > 5:
             parts.append(
-                f'<p class="muted">{len(attention) - 5} more criteria need attention. All are listed in the results table.</p>'
+                f'<p class="muted">{len(attention) - 5} more checks need attention. All of them are listed under All checks.</p>'
             )
         parts.append("</section>")
     groups = report.get("groups", [])
     if groups:
         parts.append(
-            '<section id="summary"><h2>Summary by question</h2><p>Each question'
-            " rolls up its own criteria. A question answers with the worst status"
-            ' among them.</p><div class="questions">'
+            '<section id="summary"><h2>The five questions</h2><p>Each question'
+            " answers with the worst result among its own checks. Ten checks"
+            " decide the result. The rest are information only.</p>"
+            '<div class="questions">'
         )
         for group in groups:
             counts = ", ".join(
@@ -244,8 +261,8 @@ def render_html(report, links=None):
                 f'<div class="question"><h3>{esc(group["question"])}</h3>'
                 + badge(group["status"])
                 + f'<p>{esc(group["summary"])}</p>'
-                + f'<p class="muted">{esc(counts) if counts else "No criteria"}</p>'
-                + f'<p><a href="#group-{esc(group["id"])}">See the criteria</a></p></div>'
+                + f'<p class="muted">{esc(counts) if counts else "No checks"}</p>'
+                + f'<p><a href="#group-{esc(group["id"])}">See the checks</a></p></div>'
             )
         parts.append("</div></section>")
     metadata = [
@@ -262,8 +279,8 @@ def render_html(report, links=None):
         ("Report generated", report["generated_at"]),
         ("Bucket", run["identity"]["bucket"]),
         ("Requested region", run["identity"]["region"]),
-        ("Actual flavor", report["flavor"]),
-        ("Recommended flavor", report["recommended_flavor"]),
+        ("Settings used", flavor_label(report["flavor"])),
+        ("Settings recommended", flavor_label(report["recommended_flavor"])),
         ("Latency reference", _reference_label(report)),
         ("Runner location", load.get("options", {}).get("runner_location")),
     ]
@@ -282,11 +299,11 @@ def render_html(report, links=None):
         + "</div></div></details></section>"
     )
     parts.append(
-        '<section id="results"><h2>Results and explanations</h2><p>PASS means the measured criterion met its requirement. FAIL means it did not. NOT RUN means evidence is absent; INCONCLUSIVE means evidence is insufficient or not comparable. Headroom is the measurement divided by its own limit, so 1.00× or less passes.</p><div class="tools"><label>Search <input id="search" type="search" placeholder="Find an operation or criterion"></label><label>Show <select id="status-filter"><option value="all">All results</option><option value="attention">Needs attention</option><option>PASS</option><option>FAIL</option><option>INCONCLUSIVE</option><option>NOT RUN</option></select></label></div>'
+        '<section id="results"><h2>All checks</h2><p>PASS means the check met its rule. FAIL means it did not. NOT RUN means we could not measure it. INCONCLUSIVE means we measured it, but not enough to decide. Headroom is the measurement divided by its own limit, so 1.00× or less passes. A check marked "information only" never changes the result.</p><div class="tools"><label>Search <input id="search" type="search" placeholder="Find a check or an operation"></label><label>Show <select id="status-filter"><option value="all">All results</option><option value="attention">Needs attention</option><option>PASS</option><option>FAIL</option><option>INCONCLUSIVE</option><option>NOT RUN</option></select></label></div>'
     )
-    headers = ["Criterion", "Observed", "Requirement", "Headroom", "Result"]
+    headers = ["Check", "What we measured", "Rule", "Headroom", "Result"]
     for group in report.get("groups", []) or [
-        {"id": "all", "question": "All criteria", "status": report["verdict"]}
+        {"id": "all", "question": "All checks", "status": report["verdict"]}
     ]:
         members = [
             c
@@ -298,17 +315,18 @@ def render_html(report, links=None):
             if per_operation(c):
                 continue
             detail = (
-                f"<details><summary>Why this matters</summary><p>{esc(c['explanation'])}</p>"
+                f"<details><summary>What this means</summary><p>{esc(c['explanation'])}</p>"
                 + (
-                    f"<p><strong>Next step:</strong> {esc(c['action'])}</p>"
+                    f"<p><strong>What to do:</strong> {esc(c['action'])}</p>"
                     if c["action"]
                     else ""
                 )
+                + source_line(c)
                 + "</details>"
             )
             rows.append(
                 f'<tr id="check-{esc(c["id"])}" data-status="{esc(c["status"])}"><td>{esc(c["title"])}'
-                + (" <small>(optional)</small>" if not c["required"] else "")
+                + ("" if c["required"] else " <small>(information only)</small>")
                 + f"</td><td>{esc(c['observed'])}{detail}</td><td>{esc(c['requirement'])}</td>"
                 + f"<td>{ratio_cell(c.get('ratio'))}</td><td>{badge(c['status'])}</td></tr>"
             )
@@ -327,7 +345,7 @@ def render_html(report, links=None):
             )
             rows.append(
                 f'<tr data-status="{esc(worst)}"><td>Per-operation results</td>'
-                + f"<td>{len(per_op)} criteria across {len(report['measurements'])} operations"
+                + f"<td>{len(per_op)} checks across {len(report['measurements'])} operations"
                 + (
                     "<details><summary>Which ones need attention</summary><p>"
                     + esc(", ".join(failing))
@@ -374,7 +392,7 @@ def render_html(report, links=None):
                 )
         parts.append("</div>")
         parts.append(
-            "<h3>Every operation, all three criteria</h3>"
+            "<h3>Every operation, all three checks</h3>"
             + table(
                 [
                     "Operation",
@@ -508,11 +526,23 @@ def render_html(report, links=None):
                 title,
                 [r["concurrency"] for r in levels],
                 [
-                    ("Efficiency", [r["efficiency"] for r in levels]),
-                    ("Minimum", [sweep["efficiency_floor"]] * len(levels)),
+                    ("Speedup", [r.get("speedup") for r in levels]),
+                    (
+                        "Minimum",
+                        [sweep.get("min_speedup_required")] * len(levels),
+                    ),
                 ],
                 "Concurrent requests",
-                "Efficiency",
+                "Requests absorbed at once",
+            )
+            + (
+                '<p class="muted">Peak throughput '
+                + fmt(sweep.get("peak_requests_per_s"))
+                + " requests per second at concurrency "
+                + esc(sweep.get("peak_at_concurrency"))
+                + ". A peak can mean this runner saturated, not the backend.</p>"
+                if sweep.get("peak_requests_per_s")
+                else ""
             )
         )
         parts.append(
@@ -524,7 +554,9 @@ def render_html(report, links=None):
                     "Batch ms",
                     "p50 ms",
                     "p99 ms",
-                    "Efficiency",
+                    "Speedup",
+                    "Requests/s",
+                    "Latency spread",
                     "Errors",
                     "Throttles",
                 ],
@@ -546,6 +578,8 @@ def render_html(report, links=None):
                             if r.get("p99_per_request_s") is not None
                             else None
                         ),
+                        fmt(r.get("speedup")),
+                        fmt(r.get("requests_per_s")),
                         fmt(r["efficiency"]),
                         str(r["error_count"]),
                         str(r["throttle_count"]),
@@ -623,7 +657,7 @@ def render_html(report, links=None):
         note = flavor_note(rec)
         same = report["compatibility"].get("equivalent_flavors") or []
         parts.append(
-            f"<h3>Recommended Quickwit configuration · {esc(rec)}</h3>"
+            f"<h3>Recommended Quickwit configuration · {esc(flavor_label(rec))}</h3>"
             + (
                 '<p class="muted">These settings also carry the names '
                 + esc(", ".join(same))
@@ -751,7 +785,8 @@ def render_markdown(report):
         "",
         f"Run: {report['run']['run_id']} · Generated: {report['generated_at']}",
         "",
-        f"Flavor used: {report['flavor']}; recommended: {report['recommended_flavor']}",
+        f"Settings used: {flavor_label(report['flavor'])}."
+        f" Recommended: {flavor_label(report['recommended_flavor'])}.",
         "",
         f"Latency reference: {_reference_label(report)}",
         "",
@@ -760,7 +795,7 @@ def render_markdown(report):
         lines += [f"**{item['title']}.** {item['detail']}", ""]
     groups = report.get("groups", [])
     if groups:
-        lines += ["## Summary by question", "", "| Question | Answer | Criteria |",
+        lines += ["## The five questions", "", "| Question | Answer | Checks |",
                    "|---|---|---|"]
         for group in groups:
             counts = ", ".join(
@@ -770,8 +805,8 @@ def render_markdown(report):
                 f"| {cell(group['question'])} | {group['status']} | {cell(counts)} |"
             )
         lines.append("")
-    lines += ["## Criteria", ""]
-    for group in groups or [{"id": "all", "question": "All criteria"}]:
+    lines += ["## All checks", ""]
+    for group in groups or [{"id": "all", "question": "All checks"}]:
         members = [
             c
             for c in report["checks"]
@@ -781,7 +816,7 @@ def render_markdown(report):
         lines += [
             f"### {group['question']}",
             "",
-            "| Criterion | Observed | Requirement | Headroom | Result |",
+            "| Check | What we measured | Rule | Headroom | Result |",
             "|---|---|---|---|---|",
         ]
         for c in shown:
@@ -800,7 +835,7 @@ def render_markdown(report):
             )
         if len(members) > len(shown):
             lines.append(
-                f"| Per-operation results | {len(members) - len(shown)} criteria |"
+                f"| Per-operation results | {len(members) - len(shown)} checks |"
                 " See the operations matrix | — |"
                 f" {next((s for s in ('FAIL', 'INCONCLUSIVE', 'NOT RUN', 'PASS') if any(c['status'] == s for c in members if per_operation(c))), 'PASS')} |"
             )
@@ -835,11 +870,23 @@ def render_markdown(report):
                 + " |"
             )
         lines.append("")
-    lines += ["## Explanations", ""]
+    lines += ["## What each result means", ""]
     for c in report["checks"]:
         if c["status"] == "PASS" and not c["action"]:
             continue
+        source = c.get("source") or {}
+        trace = ", ".join(
+            f"{label} `{source[key]}`"
+            for key, label in (
+                ("command", "command"),
+                ("evidence", "evidence"),
+                ("setting", "setting"),
+            )
+            if source.get(key)
+        )
         lines.extend([f"### {c['title']}", "", c["explanation"], "", c["action"], ""])
+        if trace:
+            lines.extend([f"From {trace}.", ""])
     lines += [
         "## Scope",
         "",

@@ -1,6 +1,6 @@
 """
 Probes the consistency properties Quickwit's file-backed-metastore-on-S3
-mode actually relies on (docs/01_s3_interaction_analysis.md section 6):
+mode actually relies on (docs/background/01_s3_interaction_analysis.md section 6):
 
   1. Read-after-write: GET immediately after PUT must return the new content.
   2. List-after-write: a fresh ListObjectsV2 must include a just-written key.

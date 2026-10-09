@@ -1,7 +1,7 @@
 """
-Layer 2 (docs/02_test_methodology.md): scripted, functional checks of the
+Layer 2 (docs/background/02_test_methodology.md): scripted, functional checks of the
 specific S3 behaviors Quickwit's `storage.s3.*` config knobs exist to route
-around (docs/01_s3_interaction_analysis.md section 2).
+around (docs/background/01_s3_interaction_analysis.md section 2).
 
 Each check returns (passed: bool, detail: str). `probe_flavor()` tries the
 built-in Quickwit flavors in order and reports the first one that
@@ -21,13 +21,15 @@ from .qw_s3_client import (
 )
 
 
-def check_path_style_addressing(client: QwS3Client, bucket: str) -> tuple[bool, str]:
-    key = f"compat/path-style-{uuid.uuid4().hex}.txt"
+def check_path_style_addressing(client: QwS3Client, bucket: str,
+                                prefix: str = "compat") -> tuple[bool, str]:
+    key = f"{prefix}/path-style-{uuid.uuid4().hex}.txt"
     res = client.put_split(bucket, key, b"path-style-check")
     return res["ok"], res.get("error", "ok")
 
 
-def check_multipart_upload(client: QwS3Client, bucket: str) -> tuple[bool, str]:
+def check_multipart_upload(client: QwS3Client, bucket: str,
+                           prefix: str = "compat") -> tuple[bool, str]:
     """
     Goes through client.put_split(), which respects
     cfg.disable_multipart_upload -- exactly like Quickwit's own storage
@@ -38,7 +40,7 @@ def check_multipart_upload(client: QwS3Client, bucket: str) -> tuple[bool, str]:
     it, this forces the multipart code path with a small part-size override
     so we don't move 5GB in a compat check.
     """
-    key = f"compat/multipart-{uuid.uuid4().hex}.split"
+    key = f"{prefix}/multipart-{uuid.uuid4().hex}.split"
     payload = uuid.uuid4().bytes * (12 * 1024 * 1024 // 16)  # 12MB
     if client.cfg.disable_multipart_upload:
         res = client.put_split(bucket, key, payload)
@@ -50,7 +52,8 @@ def check_multipart_upload(client: QwS3Client, bucket: str) -> tuple[bool, str]:
         return False, str(e)
 
 
-def check_multi_object_delete(client: QwS3Client, bucket: str) -> tuple[bool, str]:
+def check_multi_object_delete(client: QwS3Client, bucket: str,
+                              prefix: str = "compat") -> tuple[bool, str]:
     """
     Goes through client.delete_batch(), which respects
     cfg.disable_multi_object_delete -- so a flavor that disables bulk delete
@@ -59,7 +62,7 @@ def check_multi_object_delete(client: QwS3Client, bucket: str) -> tuple[bool, st
     DeleteObjects, which is exactly the operation that flavor exists to
     avoid.
     """
-    keys = [f"compat/mod-{uuid.uuid4().hex}.txt" for _ in range(5)]
+    keys = [f"{prefix}/mod-{uuid.uuid4().hex}.txt" for _ in range(5)]
     for k in keys:
         client.put_split(bucket, k, b"x")
     res = client.delete_batch(bucket, keys)
@@ -67,8 +70,9 @@ def check_multi_object_delete(client: QwS3Client, bucket: str) -> tuple[bool, st
     return res["ok"], f"{detail} (mode={res['op']})"
 
 
-def check_range_get(client: QwS3Client, bucket: str) -> tuple[bool, str]:
-    key = f"compat/range-{uuid.uuid4().hex}.txt"
+def check_range_get(client: QwS3Client, bucket: str,
+                    prefix: str = "compat") -> tuple[bool, str]:
+    key = f"{prefix}/range-{uuid.uuid4().hex}.txt"
     payload = bytes(range(256)) * 100  # 25,600 bytes, content is checkable
     client.put_split(bucket, key, payload)
     checks = []
@@ -87,8 +91,9 @@ def check_range_get(client: QwS3Client, bucket: str) -> tuple[bool, str]:
         return False, str(e)
 
 
-def check_checksum_algorithm(client: QwS3Client, bucket: str) -> tuple[bool, str]:
-    key = f"compat/checksum-{uuid.uuid4().hex}.split"
+def check_checksum_algorithm(client: QwS3Client, bucket: str,
+                             prefix: str = "compat") -> tuple[bool, str]:
+    key = f"{prefix}/checksum-{uuid.uuid4().hex}.split"
     res = client.put_split(bucket, key, b"checksum-check-payload")
     return res["ok"], res.get("error", f"ok (algorithm={client.cfg.checksum_algorithm})")
 
@@ -102,56 +107,105 @@ CHECKS = [
 ]
 
 
-def run_all_checks(client: QwS3Client, bucket: str) -> dict:
+def run_all_checks(client: QwS3Client, bucket: str, prefix: str = "compat") -> dict:
     results = {}
     for name, fn in CHECKS:
         try:
-            ok, detail = fn(client, bucket)
+            ok, detail = fn(client, bucket, prefix)
         except Exception as e:
             ok, detail = False, f"unhandled exception: {e}"
         results[name] = {"passed": ok, "detail": detail}
     return results
 
 
+# When every flavor fails before any check runs, the cause is the connection,
+# not compatibility. These are the common causes, in plain words.
+SETUP_ERROR_HINTS = (
+    ("SignatureDoesNotMatch",
+     "The secret key does not belong to the access key. Check which keys this"
+     " run used; the source is printed at the start of the run."),
+    ("InvalidAccessKeyId",
+     "This endpoint does not know the access key. The keys may be for another"
+     " account or another storage system."),
+    ("ExpiredToken",
+     "The temporary keys have expired. Get new ones, with their session token."),
+    ("InvalidToken",
+     "The session token is missing or wrong. Temporary keys need it."),
+    ("AccessDenied",
+     "The keys work, but they may not read, write or create this bucket."),
+    ("CERTIFICATE_VERIFY_FAILED",
+     "The endpoint certificate is not trusted. Pass --ca-bundle."),
+    ("SSLError",
+     "The secure connection failed. Pass --ca-bundle, or check the port."),
+    ("EndpointConnectionError",
+     "The endpoint cannot be reached. Check the address, the port and the network."),
+)
+
+
+def setup_failure(result: dict):
+    """The shared error, when no flavor got far enough to run a check."""
+    attempts = result.get("attempts", {}).values()
+    if not attempts or any("results" in a for a in attempts):
+        return None
+    error = next((a.get("error") for a in attempts if a.get("error")), "")
+    hint = next((h for code, h in SETUP_ERROR_HINTS if code in error), None)
+    return {"error": error, "hint": hint}
+
+
 def probe_flavor(endpoint_url: str, access_key: str, secret_key: str, bucket: str,
-                  region: str = "us-east-1", verify_tls=True) -> dict:
+                  region: str = "us-east-1", verify_tls=True,
+                  session_token=None, include=None, prefix="compat") -> dict:
     """
     Try every known flavor in order; return the first one
     where every check passes, plus the full per-flavor results for the
     report. This directly answers "what storage.s3.yaml block should this
     vendor's users ship?"
+
+    `include` names a flavor the operator has chosen. The probe normally stops
+    at the first flavor that passes, so a chosen flavor later in the order
+    would never be tested. It is always tested here, so a run never measures
+    performance with settings nobody checked.
     """
     attempts = {}
     # Some flavors hold the same knob values, for example `seaweedfs` and
     # `scality`. Probing them twice costs time and shows two identical
     # columns in the report. Copy the earlier result instead, and say so.
     by_signature = {}
-    for flavor in AUTO_PROBE_ORDER:
+
+    def attempt(flavor):
         signature = flavor_signature(flavor)
         twin = by_signature.get(signature)
         if twin:
             attempts[flavor] = dict(attempts[twin], same_settings_as=twin)
-            continue
+            return attempts[flavor]["all_passed"]
         by_signature[signature] = flavor
         cfg = QwS3Config.from_flavor(
-            flavor, endpoint_url, access_key, secret_key, region, verify_tls=verify_tls
+            flavor, endpoint_url, access_key, secret_key, region,
+            verify_tls=verify_tls, session_token=session_token,
         )
         client = QwS3Client(cfg)
         try:
             client.ensure_bucket(bucket)
         except Exception as e:
             attempts[flavor] = {"error": f"bucket setup failed: {e}", "all_passed": False}
-            continue
-        results = run_all_checks(client, bucket)
+            return False
+        results = run_all_checks(client, bucket, prefix)
         all_passed = all(r["passed"] for r in results.values())
         attempts[flavor] = {"results": results, "all_passed": all_passed,
                              "yaml": cfg.as_quickwit_yaml() if all_passed else None}
-        if all_passed:
-            return {
-                "recommended_flavor": flavor,
-                # Several vendors need the same four settings. Name them all,
-                # so an operator recognises their own product.
-                "equivalent_flavors": equivalent_flavors(flavor),
-                "attempts": attempts,
-            }
-    return {"recommended_flavor": None, "equivalent_flavors": [], "attempts": attempts}
+        return all_passed
+
+    recommended = None
+    for flavor in AUTO_PROBE_ORDER:
+        if attempt(flavor):
+            recommended = flavor
+            break
+    if include and include not in attempts:
+        attempt(include)
+    return {
+        "recommended_flavor": recommended,
+        # Several vendors need the same four settings. Name them all, so an
+        # operator recognises their own product.
+        "equivalent_flavors": equivalent_flavors(recommended) if recommended else [],
+        "attempts": attempts,
+    }

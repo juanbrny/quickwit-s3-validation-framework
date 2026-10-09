@@ -1,5 +1,5 @@
 """
-Implements the math in docs/03_throughput_tier_sizing.md.
+Implements the math in docs/background/03_throughput_tier_sizing.md.
 Run `python -m src.workload_model --print-table` to regenerate the worked
 examples table after changing config/tiers.yaml.
 """

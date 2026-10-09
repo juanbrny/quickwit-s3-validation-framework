@@ -1,6 +1,6 @@
 """
 Simulates the ingest -> merge -> GC lifecycle described in
-docs/01_s3_interaction_analysis.md sections 3-4, driven by the op-mix from
+docs/background/01_s3_interaction_analysis.md sections 3-4, driven by the op-mix from
 workload_model.compute_op_mix().
 
 Each "indexer node" is a thread that:
@@ -50,12 +50,18 @@ class ResultSink:
         with self._lock:
             self._f.write(json.dumps(asdict(row)) + "\n")
 
-    def run(self, target, args, stop_event):
+    def run(self, target, args, stop_event, worker="worker"):
         try:
             target(*args)
         except Exception as error:
+            # Keep the message, not only the type. An earlier version kept the
+            # type alone, in memory, and the operator was told to "inspect raw
+            # results" that held no trace of the cause. The caller removes
+            # credentials before anything is printed or saved.
             with self._lock:
-                self.errors.append(type(error).__name__)
+                self.errors.append(
+                    {"worker": worker, "type": type(error).__name__, "message": str(error)}
+                )
             stop_event.set()
 
     def close(self):
@@ -177,7 +183,7 @@ def run_ingest_merge_sim(client: QwS3Client, bucket: str, prefix: str, op_mix: O
     run_consistency_probes() against the shared `registry` and `stop_event`
     -- this is how `run_certification.py load` actually drives all three at
     once, matching a real deployment where indexers, mergers, and searchers
-    hit the bucket simultaneously (see docs/02_test_methodology.md Layer 3).
+    hit the bucket simultaneously (see docs/background/02_test_methodology.md Layer 3).
     """
     sink = ResultSink(out_path)
     stop_event = stop_event or threading.Event()
@@ -187,7 +193,7 @@ def run_ingest_merge_sim(client: QwS3Client, bucket: str, prefix: str, op_mix: O
         t = threading.Thread(target=sink.run, args=(indexer_worker, (
             node_id, client, bucket, prefix, op_mix, duration_s, stop_event, sink,
             merge_factor, registry, commit_timeout_s
-        ), stop_event), daemon=True)
+        ), stop_event, f"indexer-{node_id}"), daemon=True)
         threads.append(t)
         t.start()
 

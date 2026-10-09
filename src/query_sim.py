@@ -1,6 +1,6 @@
 """
 Simulates query-time GET traffic using Quickwit's own documented formula
-(docs/01_s3_interaction_analysis.md section 5):
+(docs/background/01_s3_interaction_analysis.md section 5):
 
     GET requests ~= num_splits_hit
                   * ((num_search_fields * num_terms * 3) + fieldnorm_fields + 1)
@@ -73,16 +73,24 @@ def _build_query_jobs(hit_keys: list[str], profile: dict, warm_splits: set) -> l
             start = random.randint(0, 10 * 1024 * 1024)
             jobs.append(("get_term_or_field", key, start, start + TERM_LOOKUP_RANGE_BYTES - 1))
 
-        for _ in range(profile.get("docs_returned", 0)):
-            start = random.randint(0, 10 * 1024 * 1024)
-            jobs.append(("get_doc", key, start, start + DOC_FETCH_RANGE_BYTES - 1))
+    # A query returns `docs_returned` documents in total, not that many from
+    # every split it touches. The documented formula adds it once:
+    #   GETs = splits_hit x (fields x terms x 3 + fieldnorm + 1) + docs_returned
+    # An earlier version fetched them per split, which sent up to 355 reads
+    # for a query the formula sizes at 155. The documents are spread over the
+    # splits the query hit, the way top hits are.
+    for i in range(profile.get("docs_returned", 0)):
+        key = hit_keys[i % len(hit_keys)]
+        start = random.randint(0, 10 * 1024 * 1024)
+        jobs.append(("get_doc", key, start, start + DOC_FETCH_RANGE_BYTES - 1))
     return jobs
 
 
 def query_worker_loop(client: QwS3Client, bucket: str, split_keys_provider,
                        profiles: list[dict], qps: float, duration_s: float,
                        stop_event: threading.Event, sink: ResultSink,
-                       intra_query_concurrency: Optional[int] = None):
+                       intra_query_concurrency: Optional[int] = None,
+                       start_offset_s: float = 0.0):
     """
     Simulates one searcher's query traffic. Re-fetches the live key list
     from split_keys_provider() every iteration so it tracks splits as the
@@ -114,6 +122,10 @@ def query_worker_loop(client: QwS3Client, bucket: str, split_keys_provider,
     interval = 1.0 / max(qps, 0.01)
     end_time = time.time() + duration_s
 
+    # Wait for this worker's turn, so the workers together send evenly spaced
+    # queries instead of firing at the same moment.
+    if start_offset_s > 0:
+        stop_event.wait(start_offset_s)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         while time.time() < end_time and not stop_event.is_set():
             loop_start = time.time()
@@ -152,6 +164,11 @@ def query_worker_loop(client: QwS3Client, bucket: str, split_keys_provider,
             stop_event.wait(min(max(0.0, interval - elapsed), max(0, end_time-time.time())))
 
 
+def worker_offsets(qps: float, num_workers: int) -> list:
+    """Start delays that space every worker's queries evenly over time."""
+    return [i / max(qps, 0.01) for i in range(num_workers)]
+
+
 def run_query_sim(client: QwS3Client, bucket: str, split_keys_provider,
                    profiles: list[dict], qps: float, duration_min: float,
                    out_path: Path, num_workers: int = 4,
@@ -167,11 +184,15 @@ def run_query_sim(client: QwS3Client, bucket: str, split_keys_provider,
     duration_s = duration_min * 60
     threads = []
 
-    for _ in range(num_workers):
+    # Each worker sends one query every num_workers/qps seconds. Starting them
+    # 1/qps apart spreads the queries evenly. Started together, four workers
+    # at 1 query/s produced four queries at once every four seconds, which put
+    # four full fan-outs on the storage at the same moment.
+    for i, offset in enumerate(worker_offsets(qps, num_workers)):
         t = threading.Thread(target=sink.run, args=(query_worker_loop, (
             client, bucket, split_keys_provider, profiles, qps / num_workers,
-            duration_s, stop_event, sink
-        ), stop_event), daemon=True)
+            duration_s, stop_event, sink, None, offset
+        ), stop_event, f"searcher-{i}"), daemon=True)
         threads.append(t)
         t.start()
 

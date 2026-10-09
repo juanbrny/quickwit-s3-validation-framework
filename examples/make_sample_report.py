@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.concurrency_fanout import FanoutLevelResult, summarize_fanout
 from src.report_model import build_report
 from src.report_render import write_reports
 from src.run_store import digest, write_json
@@ -174,28 +175,33 @@ def make_bundle(path, aws=False):
         path / "compat.json", {"recommended_flavor": flavor, "attempts": attempts}
     )
     for stage, key in [("fanout", "fanout"), ("put-fanout", "put_fanout")]:
-        levels = cfg["pass_fail_bands"][key + "_concurrency_levels"]
-        values = []
-        for i, k in enumerate(levels):
-            eff = (
-                max(0.35, 0.88 - i * 0.045)
-                if stage == "fanout"
-                else max(0.35, 0.9 - i * 0.08)
-            )
-            values.append(
-                dict(
+        bands = cfg["pass_fail_bands"]
+        levels = bands[key + "_concurrency_levels"]
+        results = []
+        for k in levels:
+            # Wall clock grows with concurrency, but far more slowly than
+            # concurrency itself, which is what a backend serving requests
+            # together looks like.
+            latencies = [0.045] * k
+            latencies[-1] = 0.065
+            results.append(
+                FanoutLevelResult(
                     concurrency=k,
-                    wall_clock_s=0.045 / eff,
-                    p50_per_request_s=0.045,
-                    p99_per_request_s=0.065,
-                    efficiency=eff,
+                    wall_clock_s=0.045 + k * 0.0034,
+                    per_request_latencies_s=latencies,
                     error_count=0,
                     throttle_count=0,
                 )
             )
+        # Built by the real summarizer, so the sample can never describe a
+        # shape the reporting code does not produce.
         write_json(
             path / (stage + ".json"),
-            dict(levels=values, degrades_at_concurrency=None, efficiency_floor=0.4),
+            summarize_fanout(
+                results,
+                bands[key + "_efficiency_min"],
+                bands[key + "_serialization_min_speedup"],
+            ),
         )
         stages[stage]["tested_levels"] = levels
         stages[stage]["options"].update(repeats=3, levels=levels)

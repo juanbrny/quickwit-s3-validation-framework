@@ -1,7 +1,7 @@
 """
 Aggregates the raw JSONL result logs from ingest_merge_sim / query_sim /
 consistency_probes into the pass/fail scorecard described in
-docs/02_test_methodology.md, relative to an AWS S3 baseline run of the same
+docs/background/02_test_methodology.md, relative to an AWS S3 baseline run of the same
 scripts (see README quick-start step 2).
 """
 from __future__ import annotations
@@ -217,7 +217,7 @@ def render_compat_markdown(compat_result: dict, out_path: Path):
     "A Pass/Fail Table, Not a Guess") -- one column per flavor attempted by
     probe_flavor(), one row per check, plus the recommended flavor's
     storage.s3.yaml block. This is the Layer 2 report; see
-    docs/02_test_methodology.md for how it gates Layer 3.
+    docs/background/02_test_methodology.md for how it gates Layer 3.
     """
     attempts = compat_result.get("attempts", {})
     rec = compat_result.get("recommended_flavor")
@@ -235,13 +235,20 @@ def render_compat_markdown(compat_result: dict, out_path: Path):
         "# S3 API Compatibility Check",
         "",
         "One row per check, one column per flavor attempted. "
-        "See docs/01_s3_interaction_analysis.md section 2 for what each check "
+        "See docs/background/01_s3_interaction_analysis.md section 2 for what each check "
         "corresponds to in Quickwit's own storage config.",
         "",
     ]
 
-    if not flavors:
-        lines.append("_No flavors were attempted (bucket setup likely failed for all of them)._")
+    from .compat_checks import setup_failure
+
+    failure = setup_failure(compat_result)
+    if not flavors or failure:
+        lines.append("**No check ran. The tool could not connect to the endpoint.**")
+        if failure:
+            lines += ["", "```", failure["error"], "```"]
+            if failure["hint"]:
+                lines += ["", "Likely cause: " + failure["hint"]]
         out_path.write_text("\n".join(lines))
         return
 
@@ -288,7 +295,7 @@ def render_compat_markdown(compat_result: dict, out_path: Path):
             "\nThis is a pass/fail gate, not a performance result. Passing it means it's "
             "worth running the throughput-tier load tests (Layer 3) -- not that the "
             "endpoint is certified at any particular ingestion tier. See "
-            "docs/02_test_methodology.md."
+            "docs/background/02_test_methodology.md."
         )
     else:
         lines.append(

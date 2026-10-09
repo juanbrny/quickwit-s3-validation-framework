@@ -224,6 +224,10 @@ class RunSession:
                 if typ is KeyboardInterrupt
                 else "FAILED",
                 finished_at=utc_now(),
+                finished_epoch=time.time(),
+                # The process clock stops while the machine sleeps; the wall
+                # clock does not. The difference between the two is the time
+                # this machine was not running. See report_model.paused_time().
                 actual_duration_s=time.monotonic() - self.started,
             )
             if typ:

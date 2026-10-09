@@ -1,6 +1,6 @@
 """
 S3 client wrapper that mirrors Quickwit's `storage.s3.*` configuration
-surface (see docs/01_s3_interaction_analysis.md section 2), so that the same
+surface (see docs/background/01_s3_interaction_analysis.md section 2), so that the same
 compatibility axes Quickwit exposes to end users can be flipped on/off here.
 
 This intentionally does NOT reimplement Quickwit's Rust storage code. It
@@ -19,7 +19,9 @@ from typing import Optional
 
 import boto3
 from botocore.client import Config as BotoConfig
-from botocore.exceptions import ClientError
+import errno
+
+from botocore.exceptions import BotoCoreError, ClientError
 
 # Storage flavors. Each one is a named combination of the `storage.s3.*`
 # knobs Quickwit exposes.
@@ -153,6 +155,22 @@ def same_settings(a: Optional[str], b: Optional[str]) -> bool:
     return flavor_signature(a) == flavor_signature(b)
 
 
+def flavor_label(flavor: Optional[str]) -> str:
+    """How a flavor reads to a person.
+
+    The internal name `none` means "no flavor setting, Quickwit's defaults".
+    Printed bare, "flavor: none" reads like a missing value, so it is never
+    shown that way.
+    """
+    if flavor is None:
+        return "not recorded"
+    if flavor == "none":
+        return "Quickwit defaults (no flavor setting)"
+    if flavor == "aws":
+        return "aws (AWS S3 defaults)"
+    return flavor
+
+
 def flavor_note(flavor: Optional[str]) -> Optional[str]:
     """Warn when Quickwit does not accept this flavor name in its config."""
     if flavor is None or flavor in UPSTREAM_FLAVORS or flavor in DEFAULT_FLAVORS:
@@ -187,11 +205,14 @@ class QwS3Config:
     # private certificate authority (CA) bundle, which on-premises appliances
     # usually need. False skips verification.
     verify_tls: object = True
+    # Temporary credentials (keys starting with ASIA) only work with their
+    # session token. Without it, AWS rejects every signed request.
+    session_token: Optional[str] = None
 
     @classmethod
     def from_flavor(cls, flavor: str, endpoint_url, access_key, secret_key,
                      region="us-east-1", max_concurrency=50,
-                     verify_tls=True) -> "QwS3Config":
+                     verify_tls=True, session_token=None) -> "QwS3Config":
         preset = FLAVOR_PRESETS[flavor]
         return cls(
             endpoint_url=endpoint_url, access_key=access_key, secret_key=secret_key,
@@ -203,6 +224,7 @@ class QwS3Config:
             region_override=preset["region_override"],
             max_concurrency=max_concurrency,
             verify_tls=verify_tls,
+            session_token=session_token,
         )
 
     def as_quickwit_yaml(self) -> str:
@@ -234,6 +256,7 @@ class QwS3Client:
             endpoint_url=cfg.endpoint_url,
             aws_access_key_id=cfg.access_key,
             aws_secret_access_key=cfg.secret_key,
+            aws_session_token=cfg.session_token,
             region_name=cfg.region,
             config=boto_cfg,
             verify=cfg.verify_tls,
@@ -272,6 +295,8 @@ class QwS3Client:
         except ClientError as e:
             return {"ok": False, "op": "put_object", "latency_s": time.perf_counter() - t0,
                     "error": e.response.get("Error", {}).get("Code", str(e))}
+        except BotoCoreError as e:
+            return connection_failure("put_object", t0, e)
 
     def _checksum_kwargs(self, data: bytes) -> dict:
         return checksum_kwargs_for(self.cfg, data)
@@ -317,6 +342,8 @@ class QwS3Client:
         except ClientError as e:
             return {"ok": False, "op": "get_object_full", "latency_s": time.perf_counter() - t0,
                     "error": e.response.get("Error", {}).get("Code", str(e))}
+        except BotoCoreError as e:
+            return connection_failure("get_object_full", t0, e)
 
     def get_range(self, bucket: str, key: str, start: int, end: Optional[int]) -> dict:
         t0 = time.perf_counter()
@@ -329,6 +356,8 @@ class QwS3Client:
         except ClientError as e:
             return {"ok": False, "op": "get_object_range", "latency_s": time.perf_counter() - t0,
                     "error": e.response.get("Error", {}).get("Code", str(e))}
+        except BotoCoreError as e:
+            return connection_failure("get_object_range", t0, e)
 
     # ---- deletes: bulk vs per-object fallback ------------------------------
     def delete_batch(self, bucket: str, keys: list[str]) -> dict:
@@ -356,6 +385,8 @@ class QwS3Client:
         except ClientError as e:
             return {"ok": False, "op": "delete_objects_bulk", "latency_s": time.perf_counter() - t0,
                     "error": e.response.get("Error", {}).get("Code", str(e))}
+        except BotoCoreError as e:
+            return connection_failure("delete_objects_bulk", t0, e)
 
     # ---- listing (GC reconciliation) --------------------------------------
     def list_prefix(self, bucket: str, prefix: str) -> dict:
@@ -370,6 +401,8 @@ class QwS3Client:
         except ClientError as e:
             return {"ok": False, "op": "list_objects_v2", "latency_s": time.perf_counter() - t0,
                     "error": e.response.get("Error", {}).get("Code", str(e))}
+        except BotoCoreError as e:
+            return connection_failure("list_objects_v2", t0, e)
 
     # ---- metastore-mode full read/overwrite --------------------------------
     def metastore_read(self, bucket: str, key: str) -> dict:
@@ -377,6 +410,45 @@ class QwS3Client:
 
     def metastore_write(self, bucket: str, key: str, data: bytes) -> dict:
         return self.put_split(bucket, key, data)
+
+
+class RunnerLimitError(RuntimeError):
+    """The test machine, not the storage, ran out of a resource."""
+
+
+def is_runner_fault(error: BaseException) -> bool:
+    """True when an error comes from this machine running out of open files.
+
+    Such an error is not the storage's fault. Counting it as a failed request
+    would blame the vendor for a limit on the test machine.
+    """
+    seen, depth = error, 0
+    while seen is not None and depth < 10:
+        if isinstance(seen, OSError) and seen.errno == errno.EMFILE:
+            return True
+        if "Too many open files" in str(seen):
+            return True
+        seen, depth = seen.__cause__ or seen.__context__, depth + 1
+    return False
+
+
+def connection_failure(op: str, t0: float, error: BaseException) -> dict:
+    """Record a connection-level error as one failed request.
+
+    A dropped connection or a timeout is a failed request, which is exactly
+    what the failed-requests check counts. An earlier version let these
+    errors escape, which stopped the whole workload over one request and
+    recorded nothing. Running out of open files is the exception: it stops
+    the run, with a message naming the real cause.
+    """
+    if is_runner_fault(error):
+        raise RunnerLimitError(
+            "This machine ran out of open files. That is a limit of the test"
+            " machine, not of the storage. Run `ulimit -n 4096` in this shell"
+            " and start again."
+        ) from error
+    return {"ok": False, "op": op, "latency_s": time.perf_counter() - t0,
+            "error": type(error).__name__}
 
 
 def ensure_file_descriptors(required: int) -> int:

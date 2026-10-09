@@ -6,7 +6,7 @@ indexer: can this backend sustain many concurrent PutObject calls without
 serializing them or degrading per-request latency?
 
 This matters for the same reason range-GET concurrency matters, and for a
-documented reason specific to ingest: per docs/01_s3_interaction_analysis.md
+documented reason specific to ingest: per docs/background/01_s3_interaction_analysis.md
 section 3, Quickwit's own engineering team chose the c5n.2xlarge instance
 type for the indexer fleet *for its network throughput to S3, not its
 compute power*, and reached ~27 MB/s per core in their adversarial
@@ -37,10 +37,10 @@ from pathlib import Path
 from typing import Optional
 
 import aioboto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 from .concurrency_fanout import FanoutLevelResult, DEFAULT_LEVEL_REPEATS
-from .qw_s3_client import QwS3Config, boto_config, checksum_kwargs_for
+from .qw_s3_client import QwS3Config, boto_config, checksum_kwargs_for, connection_failure
 
 DEFAULT_CONCURRENCY_LEVELS = [1, 8, 16, 32, 64, 128]
 DEFAULT_PUT_SIZE_KB = 512  # a small immature-split-sized commit, per docs/03
@@ -52,6 +52,7 @@ def _async_client_kwargs(cfg: QwS3Config, top_concurrency: int) -> dict:
         endpoint_url=cfg.endpoint_url,
         aws_access_key_id=cfg.access_key,
         aws_secret_access_key=cfg.secret_key,
+        aws_session_token=cfg.session_token,
         region_name=cfg.region,
         config=boto_cfg,
         verify=cfg.verify_tls,
@@ -67,6 +68,8 @@ async def _put_one_async(s3_client, cfg: QwS3Config, bucket: str, key: str, payl
     except ClientError as e:
         return {"ok": False, "op": "put_object", "latency_s": time.perf_counter() - t0, "key": key,
                 "error": e.response.get("Error", {}).get("Code", str(e))}
+    except (BotoCoreError, OSError) as e:
+        return {**connection_failure("put_object", t0, e), "key": key}
 
 
 async def _run_one_level(s3_client, cfg: QwS3Config, bucket: str, prefix: str,

@@ -19,7 +19,10 @@ which talks to S3 over real HTTP via aiohttp, and mock_aws()'s monkeypatch
 of botocore internals doesn't implement the response interface aiobotocore
 expects.
 """
+import pytest
+
 from src.concurrency_fanout import (
+    FanoutLevelResult,
     prepare_fanout_object,
     run_fanout_sweep,
     summarize_fanout,
@@ -76,3 +79,65 @@ def test_summarize_fanout_produces_well_formed_rows(moto_server_endpoint):
         assert row["error_count"] == 0
         assert row["throttle_count"] == 0
         assert row["wall_clock_s"] >= 0
+
+
+# Measured against AWS S3 us-east-1 from one laptop, and against a NetApp
+# StorageGRID appliance on a local network. Both runs recorded zero errors and
+# zero throttles at every level, so both must pass the sweep. Columns are
+# concurrency, batch wall clock in seconds, and median request latency.
+AWS_S3_REFERENCE = [
+    (1, 0.661, 0.660), (8, 0.609, 0.556), (16, 0.889, 0.461), (32, 0.724, 0.440),
+    (64, 0.837, 0.391), (128, 0.991, 0.567), (256, 5.370, 0.503),
+]
+STORAGEGRID_MEASURED = [
+    (1, 0.053, 0.050), (8, 0.056, 0.022), (16, 0.063, 0.019), (32, 0.066, 0.020),
+    (64, 0.081, 0.031), (128, 0.117, 0.051), (256, 0.280, 0.114),
+    (512, 0.662, 0.280), (1024, 1.724, 0.469),
+]
+
+
+def _levels(rows):
+    return [
+        FanoutLevelResult(
+            concurrency=k,
+            wall_clock_s=wall,
+            per_request_latencies_s=[p50] * max(k, 1),
+            error_count=0,
+            throttle_count=0,
+        )
+        for k, wall, p50 in rows
+    ]
+
+
+@pytest.mark.parametrize(
+    "name,rows", [("aws", AWS_S3_REFERENCE), ("storagegrid", STORAGEGRID_MEASURED)]
+)
+def test_backends_with_no_errors_pass_the_serialization_gate(name, rows):
+    """
+    Regression test for a gate that failed its own reference implementation.
+
+    The sweep used to score median request latency over batch wall clock, and
+    fail anything under 0.4. Wall clock is bounded by the slowest request in
+    the batch, so that ratio falls as concurrency rises for every backend. AWS
+    S3 scored 0.09 at concurrency 256 here, and StorageGRID scored 0.27 at
+    1024 while absorbing 278 requests' worth of latency at once. Both were
+    marked as serializing. Neither was.
+    """
+    summary = summarize_fanout(_levels(rows), min_speedup=2.0)
+    assert summary["serializes_at_concurrency"] is None
+    assert summary["min_speedup"] >= 2.0
+    # The old diagnostic still shows the latency spread, and still dips below
+    # the old floor. It must no longer decide anything.
+    assert min(level["efficiency"] for level in summary["levels"]) < 0.4
+
+
+def test_a_serializing_backend_is_detected():
+    """
+    A backend that serves one request at a time gives a batch wall clock of
+    concurrency x latency, so its speedup stays near 1 however many requests
+    the client offers at once.
+    """
+    serialized = [(k, 0.05 * k, 0.05) for k in (1, 8, 16, 32)]
+    summary = summarize_fanout(_levels(serialized), min_speedup=2.0)
+    assert summary["serializes_at_concurrency"] == 8
+    assert summary["min_speedup"] == pytest.approx(1.0, abs=0.01)

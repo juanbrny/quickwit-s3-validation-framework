@@ -1,166 +1,211 @@
 # Read the report
 
-Open `report.html`. This page walks through it from top to bottom. Generate the
-sample report first if you want to follow along:
+Open `report.html` in a browser. This page explains it from top to bottom.
 
-```bash
-python examples/make_sample_report.py --out-dir reports/example
+To see a report without running anything, see the last section of
+[Run a validation](run_a_validation.md#see-a-report-without-running-anything).
+
+The report also comes as `report.md` and `report.json`. They hold the same
+results. Use the JSON file in automated pipelines.
+
+## 1. The result
+
+The top of the report shows one result.
+
+| Result | Meaning |
+|---|---|
+| CERTIFIED | All ten deciding checks passed, with no setting changes. |
+| CERTIFIED WITH DEVIATION | All ten passed, but Quickwit needs the settings the report prints. |
+| NOT CERTIFIED | At least one deciding check failed. |
+| INCONCLUSIVE | Nothing failed, but at least one deciding check was not measured. |
+
+**Today a run cannot reach CERTIFIED.** The merge backlog check has no
+measurement yet, so it always says NOT RUN. A clean run therefore ends at
+INCONCLUSIVE.
+
+So read the result as one question: **did anything fail?**
+
+## 2. What this report can conclude
+
+A box under the result lists what the report cannot tell you. For example:
+
+- that the test machine stopped for a while, for example because it went to
+  sleep — the report then leaves that time out, so the storage is not blamed
+  for it;
+- that only some of the steps ran;
+- that response times were compared with published AWS figures, not with your
+  own AWS run;
+- that the certificate was not checked.
+
+Read this box before you trust any number below it.
+
+## 3. What needs attention
+
+A short list of the checks that did not pass, with failures first. Each item
+links to its row further down.
+
+## 4. The five questions
+
+Six boxes. Five are the questions from
+[What this tool measures](what_this_measures.md). The sixth says whether the
+run itself can be trusted.
+
+Each box shows the worst result among its checks. If a box says PASS, every
+check under it passed.
+
+## 5. All checks
+
+One table for each question. Each row is one check:
+
+| Column | Meaning |
+|---|---|
+| Check | The name of the check. |
+| What we measured | The number we got. |
+| Rule | What the number had to be. |
+| Headroom | The number divided by its limit. See below. |
+| Result | PASS, FAIL, NOT RUN or INCONCLUSIVE. |
+
+Click **What this means** on any row. It explains the check, says what to do
+if it failed, and names where the number came from:
+
+```text
+From command load, evidence consistency.jsonl, setting consistency_probe_min_success_pct.
 ```
 
-The Markdown and JavaScript Object Notation (JSON) files carry the same
-verdicts. The JSON file is the one to parse in automation.
+That line tells you which step measured it, which file holds the raw data,
+and which line in `config/tiers.yaml` set the limit.
 
-## Start with the four questions
+A row marked **(information only)** is shown, but never changes the result.
 
-The **Summary by question** section is the part to read first. Every criterion
-belongs to exactly one question, and each question reports the worst status
-among its own criteria.
+### The four results
 
-| Question | What it covers |
+| Result | Meaning |
 |---|---|
-| Can I trust this evidence? | The run finished, the files are unchanged, and the reference run is comparable. |
-| Does it behave like S3? | The application programming interface (API) semantics Quickwit depends on, plus object visibility. |
-| Can it keep up? | Sustained rate, error rate, throttling and concurrency scaling. |
-| Is it fast enough? | Response times, against the allowed multiple of the Amazon Web Services (AWS) Simple Storage Service (S3) reference. |
+| PASS | We measured enough, and the number met the rule. |
+| FAIL | We measured it, and the number broke the rule. |
+| NOT RUN | We could not measure it. That step did not run. |
+| INCONCLUSIVE | We measured something, but not enough to decide. |
 
-A question answered PASS means every required criterion under it passed. Click
-through to its table for the detail.
+Missing evidence never counts as a pass.
 
-## The verdict, and what it can be today
+### Headroom
 
-The headline verdict is one of four values.
+Headroom is one number per check. It is the measurement divided by its limit.
 
-- **CERTIFIED** — every required criterion passed, with no configuration
-  deviation.
-- **CERTIFIED WITH DEVIATION** — every required criterion passed, but the
-  endpoint needs a non-default `storage.s3.*` configuration. The report prints
-  the exact block to ship.
-- **NOT CERTIFIED** — a required criterion failed.
-- **INCONCLUSIVE** — nothing failed, but the evidence is incomplete.
+- `0.68×` means the measurement used 68% of what it was allowed.
+- `1.00×` means it is exactly on the limit.
+- `1.12×` means it is 12% over the limit. The check fails.
 
-**Today the verdict cannot reach CERTIFIED.** Merge backlog is a required
-criterion and this simulator has no measurement for it, so it is always NOT
-RUN. The report says this in the box under the verdict. A good run therefore
-ends at INCONCLUSIVE.
+**Above 1.00× always means a problem.** This holds even for rules like "at
+least 95% of target". There the tool turns the ratio around, so a bigger number
+still means worse.
 
-That does not make the report empty. A FAIL anywhere is a real failure, and the
-per-criterion detail is what you act on. Read the verdict as "did anything
-fail", not as "did it pass".
+## 6. Performance
 
-## Status values
+### The operations table
 
-| Status | Meaning |
+Three deciding checks cover every operation: response time, failed requests,
+and slowed-down requests. Each one fails if any single operation fails. This
+table shows every operation on its own row, so you can find which one:
+
+| Operation | Samples | Median payload | p99 ms | Limit ms | Headroom | Latency | Errors | Throttling |
+|---|---|---|---|---|---|---|---|---|
+| Split upload | 120 | 6.752 MiB | 66.83 | 320.05 | 0.21× | PASS | PASS | PASS |
+| Simulated query completion | 1800 | 0.000 MiB | 462.00 | 425.00 | 1.09× | FAIL | PASS | PASS |
+
+Read across the three result columns to find the failing operation. Then read
+its headroom to see how far off it is.
+
+`p99` is the response time that 99 out of 100 requests are faster than.
+
+**Median payload** is there because the limit depends on it. A small read is
+judged on how fast the first byte arrives. A large read is judged on transfer
+speed.
+
+What the operation names mean in Quickwit:
+
+| Operation | What Quickwit uses it for |
 |---|---|
-| PASS | The criterion has enough evidence and met its threshold. |
-| FAIL | The criterion was evaluated and missed its threshold. |
-| NOT RUN | The measurement or the stage is absent. |
-| INCONCLUSIVE | The evidence exists but is insufficient, invalid or not comparable. |
+| Split upload | The indexer saves new data. |
+| Merge object read | The merger reads whole files to combine them. |
+| Split footer read, Term / field read, Document read | A search reads small parts of files. |
+| Simulated query completion | One whole search, with all its reads together. |
+| Bulk deletion | Old files are removed. |
 
-Missing evidence never counts as a pass. An optional criterion is labelled as
-such and never changes the verdict.
+### Where the AWS numbers come from
 
-## Headroom: one number per criterion
+The run details name a **latency reference**. It is one of two things:
 
-Every criterion reports **headroom**: the measurement divided by its own limit.
+- **A reference profile.** Published AWS S3 figures that ship with the tool.
+  You need no AWS account. This is the default.
+- **A measured AWS run.** You ran the same test against AWS S3 yourself. This
+  is stronger evidence, because it used your machine and your network.
 
-- `0.68×` means the measurement used 68% of what it was allowed. Good.
-- `1.00×` means it sits exactly on the limit.
-- `1.12×` means it exceeded the limit by 12%. This criterion fails.
+A published profile cannot know how far your machine is from your storage. If
+your machine is far away, your times include that distance, and the AWS
+figures do not. A measured AWS run removes that difference.
 
-The direction is always the same. For "at least" requirements, such as
-sustained throughput, the ratio is inverted so that a number above 1.00× still
-means a problem. You can scan the column without reading units.
+### Over time
 
-## The operations matrix
+Two charts show writes and searches for each minute, against the target. A
+straight line under the target means the storage is too slow overall. A sudden
+dip means it stalled.
 
-Three criteria apply to every operation the workload issues: latency, error
-rate and throttling. With nine operation types, that is up to 27 criteria.
-Listing them as individual rows buries everything else, so the criteria tables
-summarize them in one row and the **Performance** section carries the detail:
+### Concurrency
 
-| Operation | Samples | p99 ms | Limit ms | Headroom | Latency | Errors | Throttling |
-|---|---|---|---|---|---|---|---|
-| Split upload | 120 | 66.83 | 99.00 | 0.68× | PASS | PASS | PASS |
-| Simulated query completion | 1800 | 462.00 | 412.50 | 1.12× | FAIL | PASS | PASS |
+Two charts show **speedup** against the number of requests sent at once.
+Speedup says how much faster a group finished than one-by-one handling would.
 
-Read down the three status columns to find the failing operation, then read its
-headroom to see how far off it is. The operation names map to Quickwit's work
-like this:
+- Speedup near 1: the storage handled the requests one after another.
+- Speedup that grows with the group size: it handled them together.
 
-| Operation | Where it comes from |
-|---|---|
-| Split upload, Multipart upload | The indexer writing a split at each commit. |
-| Merge object read | The merger reading whole splits. |
-| Split footer read, Term / field read, Document read | The searcher's byte-range reads. |
-| Simulated query completion | One query's whole read fan-out, measured end to end. |
-| Bulk deletion, Individual deletions | The janitor removing merged and expired splits. |
+The rule is a speedup of at least 2 at every level, with no failed requests.
 
-`p99` is the latency below which 99% of recorded outcomes fall. Limits are a
-multiple of the AWS reference, not absolute numbers.
+Requests per second also appears. Where it stops growing, something is full.
+That can be your own machine, not the storage. A laptop on the internet fills
+up long before a data center does.
 
-**Median payload** is in the matrix because the limit depends on it. A 2 KiB
-document read is graded on round-trip time. An 8 GB merge read is graded on
-transfer rate. One reference produces both.
+## 7. Compatibility and the settings to use
 
-## Which AWS reference was used
+A table shows each known set of settings against each of the five
+compatibility checks. The tool stops at the first set that passes everything.
+Later sets show NOT RUN. That is normal.
 
-The run details list a **Latency reference**, and it is one of two things.
+**Quickwit defaults (no flavor setting)** means Quickwit's own settings
+worked, and you need no special configuration. That is the best result.
 
-- **A reference profile.** The published bar, bundled with the framework. No
-  AWS account needed. The Evidence section prints the whole profile, including
-  where its numbers come from. This is the default.
-- **A measured AWS run.** Supplied with `--baseline`. Stronger evidence,
-  because it shares this runner and this network with the run under test.
+The report grades the settings the run actually used. If you chose settings
+with `--flavor`, the report grades those, and also names the mildest settings
+that would work.
 
-A profile states what AWS S3 delivers from an instance in the same region as
-its bucket. It cannot know how far your runner sits from the endpoint under
-test. If your runner is far away, your own results carry that distance and the
-profile does not. A measured baseline removes that gap. The report flags this
-whenever a profile is in use.
+If the top of the report says **This run used plain HTTP**, the compatibility
+result may not hold over HTTPS. Uploads send their checksum differently over
+the two. Test again over HTTPS if production uses HTTPS.
 
-## Compatibility and the configuration to ship
+Below the table are the exact `storage.s3` settings to copy into a Quickwit
+config file. If the settings carry a name Quickwit does not know, the report
+says so. Then copy the settings, not the name.
 
-This section holds a table of flavor against check. The probe stops at the
-first flavor that passes everything, so later flavors show as NOT RUN. That is
-expected, not a gap.
+Some storage systems need the same settings. The report lists every name that
+shares them, so you see your own product named.
 
-Below the table is the `storage.s3.*` block to ship. Copy it verbatim. When the
-recommended flavor is one this framework adds rather than one Quickwit knows,
-the report says so, because Quickwit will not accept that name in its
-configuration.
+## 8. Consistency
 
-## Performance over time
+Three checks: after a write, after a list, and after a delete, we look again
+straight away. Quickwit assumes the change is already visible.
 
-Two charts show successful ingestion and query rate per 60-second window,
-against the target. Use them to tell a steady shortfall from a stall. A
-sustained-rate criterion fails when any complete window drops below its
-threshold, so one stall is enough to fail it.
+## 9. Evidence and scope
 
-The concurrency sweeps plot efficiency against concurrency. Efficiency is
-typical request latency divided by the wall-clock time of the whole batch. A
-flat line near 1.0 means the backend truly runs requests concurrently. A line
-that falls as concurrency rises means it serializes them, which is what breaks
-Quickwit's query fan-out.
-
-## Consistency
-
-Three probes check read-after-write, list-after-write and delete visibility.
-Each one does an immediate follow-up operation. It does not poll until the
-object appears, so the result describes immediate visibility only.
-
-## Evidence and scope
-
-The last section lists the interpretation limits, links the original
-measurement files, and holds the full run manifest with the thresholds that
-were in force. The download links need the `report-evidence/` directory next to
-the HTML file.
+The last section lists the limits of what the tool measures. It links the raw
+measurement files, and shows every setting that was in force for the run.
 
 ## What to do next
 
 | You see | Do this |
 |---|---|
-| A FAIL in "Is it fast enough?" | Open the matrix, find the operation, check its headroom and sample count. Then look at concurrency and contention on the backend. |
-| A FAIL in "Can it keep up?" | Check the timeline charts for stalls, and the error breakdown for codes. Confirm the runner itself was not the bottleneck. |
-| INCONCLUSIVE on latency criteria | Usually a missing or mismatched reference run. Re-run with `--with-aws-baseline`. |
-| INCONCLUSIVE from sample counts | Run longer. Each operation needs at least 100 samples on both sides. |
-| A compatibility FAIL | Read `compat.md`. It names the failing check under each flavor. |
+| FAIL in "Is the storage as fast as AWS S3?" | Open the operations table. Find the operation over its limit. Check its sample count. |
+| FAIL in "Can the storage keep up?" | Look at the charts for a dip or a stall. Check that your own machine was not the limit. |
+| INCONCLUSIVE response times | Not enough samples, or no AWS reference. Run longer, or check the latency reference. |
+| FAIL in concurrency | Compare speedup with requests per second. If requests per second stopped growing early, test from a machine closer to the storage. |
+| FAIL in compatibility | Open `compat.md` in the run directory. It names the failing check under each set of settings. |
+| "Only 1 of the 4 stages ran" | The other questions read NOT RUN. Run the missing steps, or use `certify`. |

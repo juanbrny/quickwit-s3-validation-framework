@@ -33,7 +33,7 @@ S3TEST_CONF=s3tests.conf tox -- \
 ```
 
 Focus the `-k` filter on the operation families that Quickwit actually uses.
-See `docs/01_s3_interaction_analysis.md` §7 for the list.
+See `docs/background/01_s3_interaction_analysis.md` §7 for the list.
 The full suite includes many ACL (Access Control List), versioning, and lifecycle tests.
 Quickwit never uses these operations, so a vendor should not need to pass them for this certification.
 

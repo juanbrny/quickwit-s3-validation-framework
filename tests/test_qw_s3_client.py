@@ -1,6 +1,6 @@
 """
 Verifies qw_s3_client.py's flavor-aware behavior actually branches the way
-docs/01_s3_interaction_analysis.md section 2 says it should -- single PUT vs
+docs/background/01_s3_interaction_analysis.md section 2 says it should -- single PUT vs
 multipart, bulk delete vs per-object fallback, path-style addressing, and
 range-GET semantics -- against moto's in-memory S3 emulator.
 """
@@ -246,3 +246,56 @@ def test_tls_verification_setting_reaches_the_client(moto_s3, verify, expected):
     assert client._client.meta.endpoint_url is not None
     # botocore stores the caller's choice on the endpoint's TLS context.
     assert client._client._endpoint.http_session._verify == expected
+
+
+def test_a_dropped_connection_counts_as_one_failed_request(moto_s3, monkeypatch):
+    """
+    A dropped connection or a timeout is a failed request, which is what the
+    failed-requests check counts. It used to escape instead, which stopped a
+    whole 30-minute workload over one request and recorded nothing.
+    """
+    from botocore.exceptions import EndpointConnectionError
+
+    client = _client()
+    client.ensure_bucket(TEST_BUCKET)
+
+    def dropped(**kwargs):
+        raise EndpointConnectionError(endpoint_url="http://storage.test")
+
+    monkeypatch.setattr(client._client, "get_object", dropped)
+    result = client.get_range(TEST_BUCKET, "any", 0, 99)
+    assert result["ok"] is False
+    assert result["error"] == "EndpointConnectionError"
+
+
+def test_running_out_of_files_is_blamed_on_the_machine(moto_s3, monkeypatch):
+    """
+    macOS gives a program 256 open files by default. Running out is a limit of
+    the test machine. Counting it as a failed request would blame the storage.
+    """
+    import errno
+
+    from botocore.exceptions import EndpointConnectionError
+
+    from src.qw_s3_client import RunnerLimitError
+
+    client = _client()
+    client.ensure_bucket(TEST_BUCKET)
+
+    def out_of_files(**kwargs):
+        try:
+            raise OSError(errno.EMFILE, "Too many open files")
+        except OSError as cause:
+            raise EndpointConnectionError(endpoint_url="http://storage.test") from cause
+
+    monkeypatch.setattr(client._client, "get_object", out_of_files)
+    with pytest.raises(RunnerLimitError, match="not of the storage"):
+        client.get_range(TEST_BUCKET, "any", 0, 99)
+
+
+def test_the_workload_step_asks_for_enough_open_files():
+    """Four search workers can need 620 sockets at once, far above macOS's 256."""
+    from run_certification import load_file_descriptors
+    from src.workload_model import load_config
+
+    assert load_file_descriptors(load_config()) >= 4 * 155 + 256

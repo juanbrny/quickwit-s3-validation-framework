@@ -133,7 +133,7 @@ def test_flavors_with_identical_settings_are_probed_once(moto_s3, monkeypatch):
     """
     calls = []
 
-    def failing_checks(client, bucket):
+    def failing_checks(client, bucket, prefix="compat"):
         calls.append(client.cfg.checksum_algorithm)
         return {"path_style_addressing": {"passed": False, "detail": "refused"}}
 

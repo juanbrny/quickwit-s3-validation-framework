@@ -1,195 +1,279 @@
 # Run a validation
 
-This page is the how-to. To understand the output, read
-[Read the report](read_the_report.md). For the exact rules behind each
-threshold, read [Measurement policy](measurement_policy.md).
+Every command for running the tool is on this page, and only here. To
+understand the output, read [Read the report](read_the_report.md).
 
 ## What you need
 
 - Python 3.9 or later.
-- An empty bucket on the endpoint under test. The run writes and deletes
+- A bucket on the storage system you want to test. The run writes and deletes
   objects under the `qwcert/` prefix.
-- An access key and a secret key with read, write and delete rights on that
+- An access key and a secret key that can read, write and delete in that
   bucket.
-- No Amazon Web Services (AWS) account is needed. Latency is graded against a
-  bundled reference profile, which states what AWS Simple Storage Service (S3)
-  delivers from an instance in the same region as its bucket.
-- Optional: an AWS bucket of your own. A measured run is stronger evidence,
-  because it shares this machine and network with the run under test.
+
+You do not need an Amazon Web Services (AWS) account. The tool compares your
+storage with published AWS S3 figures. If you do have an AWS account, you can
+measure AWS yourself. See [Compare with your own AWS run](#compare-with-your-own-aws-run).
 
 ```bash
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Step 1: set the connection once
+## Step 1: set the connection
 
-Every connection setting reads from an environment variable, so the commands
-stay short. Put the exports in a file and source it.
+Put these lines in a file, for example `vendor.env`:
 
 ```bash
-# vendor.env
-export QW_S3_ENDPOINT=https://s3.vendor.example.com
-export QW_S3_BUCKET=qw-cert
+export QW_S3_ENDPOINT=https://s3.example.com
+export QW_S3_BUCKET=my-test-bucket
 export QW_S3_ACCESS_KEY=...
 export QW_S3_SECRET_KEY=...
 export QW_S3_REGION=us-east-1
 ```
 
+Then load it in your shell:
+
 ```bash
 source vendor.env
 ```
 
-Command-line flags override the environment. `--access-key` and `--secret-key`
-also fall back to `$AWS_ACCESS_KEY_ID` and `$AWS_SECRET_ACCESS_KEY`.
+### Where the keys come from
 
-## Step 2: smoke run, about one minute
+The tool looks for keys in this order, and uses the first it finds:
 
-Run this first, every time. It proves the credentials, the bucket rights and
-the endpoint work before you commit to a long soak.
+1. The `--access-key` and `--secret-key` flags.
+2. `$QW_S3_ACCESS_KEY` and `$QW_S3_SECRET_KEY`.
+3. `$AWS_ACCESS_KEY_ID` and `$AWS_SECRET_ACCESS_KEY`.
 
-```bash
-python run_certification.py certify --tier 100GB --duration-min 1 \
-  --levels 1,8,16 --repeats 1
+Step 3 matters. If your shell already has AWS keys from another tool, the
+run can use them by mistake. Every run therefore prints where its keys came
+from, before it sends any request:
+
+```text
+Endpoint under test: keys from $AWS_ACCESS_KEY_ID, access key AKIA…
 ```
 
-The report it writes is not a certification. A one-minute run collects too few
-samples. You are checking that the sequence completes.
+If that line names the wrong source, set `QW_S3_ACCESS_KEY` and
+`QW_S3_SECRET_KEY`. They win over the AWS variables.
+
+Temporary keys start with `ASIA`. They only work together with a session
+token. Set `$AWS_SESSION_TOKEN`, or pass `--session-token`.
+
+## Step 2: a one-minute test
+
+Run this first, every time. It proves the keys, the bucket and the address
+all work, before you start a long test.
+
+```bash
+python run_certification.py certify --tier 100GB --duration-min 1 --levels 1,8,16 --repeats 1
+```
+
+This is not a real result. One minute collects too few samples. You only check
+that every step finishes.
+
+### Keep the machine awake
+
+A long run stops being a test of the storage if the test machine sleeps. On a
+Mac, the tool keeps the machine awake by itself while a run is going. Keep the
+lid open, though: closing it can still put a MacBook to sleep. On other
+systems, make sure the machine cannot sleep or suspend during the run.
+
+If the machine does stop, the report says so at the top, and leaves that time
+out of the results.
 
 ## Step 3: the real run
 
 ```bash
-python run_certification.py certify --tier 1TB --duration-min 30 \
-  --runner-location ec2-us-east-1a-runner-01 \
-  --with-aws-baseline \
-  --aws-bucket qw-cert-baseline \
-  --aws-access-key "$AWS_AK" --aws-secret-key "$AWS_SK"
+python run_certification.py certify --tier 1TB --duration-min 30
 ```
 
-`certify` runs five steps in order:
+`certify` runs five steps, in this order:
 
-1. **Compatibility.** Tries each flavor and recommends the first that passes
-   every check.
-2. **Read concurrency.** Sweeps concurrent range reads against one object.
-3. **Write concurrency.** The same sweep for uploads.
-4. **Workload soak.** Generates the indexer, merger, searcher and janitor
-   operation mix for the tier.
-5. **Report.** Writes HTML, JSON and Markdown into the run directory.
+1. **Compatibility.** Tries each known set of settings, and picks the first one
+   that passes every check.
+2. **Read concurrency.** Sends growing groups of reads at the same time.
+3. **Write concurrency.** The same, for uploads.
+4. **Workload.** Sends Quickwit's real storage traffic, at the daily volume you
+   chose, for the minutes you chose.
+5. **Report.** Writes `report.html`, `report.json` and `report.md`.
+6. **Cleanup.** Deletes every object this run wrote to the bucket.
 
-Without `--with-aws-baseline`, latency is graded against the bundled reference
-profile. That is the default, and it produces a full verdict.
+Each step uses the settings that step 1 picked. You do not copy anything by
+hand.
 
-With `--with-aws-baseline`, the command adds the same soak against AWS S3 and
-grades against that instead. Prefer it when you have an AWS account. The report
-only compares a measured run when the tier, duration, modelled workload, runner
-location and host environment all match, and running both legs from one command
-makes them match.
+### What cleanup deletes
 
-`--runner-location` is a free-text label for where the machine sits. Use the
-same label for both legs. Without it, the baseline comparison stays
-inconclusive.
+Every object a run writes goes into the run's own folder in the bucket:
+`qwcert/<run id>/`. Cleanup deletes only that folder. It never deletes the
+bucket, and it never touches other data in it, so you can test in a bucket
+that also holds other data.
 
-Useful options:
+Cleanup removes the objects, any unfinished multipart uploads, and old
+versions if the bucket keeps versions. It runs after the report, and also when
+the workload stopped early. It saves what it did in `cleanup.json`.
 
-| Option | Why |
+To keep the objects, for example to inspect them, add `--keep-objects`.
+
+### Which settings are used
+
+Step 1 tries known sets of settings, from the mildest to the strongest. It
+stops at the first set that passes every check. If Quickwit's own defaults
+pass, it picks those, and the report says **Quickwit defaults (no flavor
+setting)**. That is the best result: Quickwit needs no special settings.
+
+To test the settings you will actually deploy, choose them:
+
+```bash
+python run_certification.py certify --tier 1TB --duration-min 30 --flavor storagegrid
+```
+
+The tool still tests your choice first. If it fails a compatibility check, the
+run stops, so it never measures settings that do not work.
+
+### Use HTTPS if production uses HTTPS
+
+Over plain `http://`, uploads send their checksum in a different way than
+over `https://`. Some storage systems accept one way and reject the other.
+StorageGRID's documentation lists the HTTPS way as unsupported. So a test over
+HTTP can pass with settings that fail in production. Test over the same
+protocol that production uses. If the certificate comes from a private
+authority, add `--ca-bundle`.
+
+### Choose the daily volume
+
+| `--tier` | Daily volume |
 |---|---|
-| `--run-dir PATH` | Choose the output directory. A timestamped one is created by default. |
-| `--levels 1,8,16,32` | Shorten the concurrency sweeps. |
-| `--out PATH` | Write the report somewhere other than the run directory. |
-| `--strict` | Exit with status 1 when the verdict is not certified. Useful in continuous integration. |
-| `--reference <id\|path\|none>` | Choose the bundled latency reference, supply your own profile file, or switch it off. |
-| `--ca-bundle PATH` | Verify the endpoint against a private certificate authority. On-premises appliances usually need this. |
-| `--insecure-skip-tls-verify` | Skip certificate verification. The report records that the run did it. |
+| `100GB` | 100 GB per day |
+| `1TB` | 1 TB per day |
+| `10TB` | 10 TB per day |
+| `100TB` | 100 TB per day |
+| `1PB` | 1 PB per day |
+| `10PB` | 10 PB per day. Also needs `--confirm-extreme-cost`, because it costs real money. |
 
-The 10PB tier needs `--confirm-extreme-cost`. A soak at that volume runs up a
-real cloud bill.
+### Useful options
+
+| Option | Use it to |
+|---|---|
+| `--run-dir PATH` | Choose where the results go. By default, a new timestamped directory. |
+| `--flavor NAME` | Test these settings instead of the ones step 1 picks. |
+| `--keep-objects` | Leave the test objects in the bucket. |
+| `--levels 1,8,16,32` | Test fewer concurrency levels. |
+| `--ca-bundle PATH` | Trust a private certificate authority. On-premises storage usually needs this. |
+| `--insecure-skip-tls-verify` | Skip the certificate check. The report records that you did. |
+| `--strict` | Exit with status 1 when the result is not certified. Useful in automated pipelines. |
 
 ## Step 4: read the result
 
-`certify` prints the paths it wrote. Open `report.html` in a browser. It works
-offline and needs no network access.
+The command prints where it wrote the report. Open `report.html` in a browser.
+It works offline.
 
 See [Read the report](read_the_report.md).
 
-## Running the stages one by one
+## Compare with your own AWS run
 
-Use the separate commands when you need to control a step, repeat only part of
-the work, or run stages from different machines. Pass the same `--run-dir` to
-each one.
+By default, the tool compares response times with published AWS S3 figures. A
+run that you measure yourself is stronger evidence, because it uses your
+machine and your network.
 
-```bash
-RUN=reports/vendor-2026-10-07
-
-python run_certification.py compat --run-dir "$RUN"
-# Note the recommended flavor it prints, then pass it to the other stages.
-
-python run_certification.py read-concurrency  --run-dir "$RUN" --flavor minio
-python run_certification.py write-concurrency --run-dir "$RUN" --flavor minio
-python run_certification.py load --run-dir "$RUN" --flavor minio \
-  --tier 1TB --duration-min 30 --runner-location ec2-us-east-1a-runner-01
-
-python run_certification.py report --run-dir "$RUN" \
-  --baseline reports/aws-1tb-2026-10-07 --out "$RUN/report.html"
-```
-
-`read-concurrency` and `write-concurrency` were called `fanout` and
-`put-fanout`. Both old names still work.
-
-Each stage runs once per directory. To repeat an experiment, use a new
-directory. The endpoint, bucket, region and configuration must stay the same
-across the stages of one directory.
-
-The baseline is its own run directory holding a completed `load` stage against
-AWS S3. It does not need the vendor gates.
+Add the AWS details to your environment file:
 
 ```bash
-python run_certification.py load --run-dir reports/aws-1tb-2026-10-07 \
-  --endpoint https://s3.us-east-1.amazonaws.com --bucket qw-cert-baseline \
-  --access-key "$AWS_AK" --secret-key "$AWS_SK" --flavor aws \
-  --tier 1TB --duration-min 30 --runner-location ec2-us-east-1a-runner-01
+export QW_AWS_BUCKET=my-aws-bucket
+export QW_AWS_ACCESS_KEY=...
+export QW_AWS_SECRET_KEY=...
 ```
+
+Then add `--with-aws-baseline`:
+
+```bash
+python run_certification.py certify --tier 1TB --duration-min 30 --with-aws-baseline --runner-location office-laptop
+```
+
+The tool runs the same test against AWS S3, from the same machine, straight
+after the first one. `--runner-location` is a free label for where your
+machine is. Both runs must carry the same label, so give it every time.
+
+## Run the steps one by one
+
+Use this when you need to repeat one step, or run steps from different
+machines. Give every step the same `--run-dir`.
+
+```bash
+python run_certification.py compat --run-dir reports/my-test
+```
+
+It prints the settings it picked, for example `Recommended flavor: storagegrid`.
+Use that name in the next steps:
+
+```bash
+python run_certification.py read-concurrency --run-dir reports/my-test --flavor storagegrid
+python run_certification.py write-concurrency --run-dir reports/my-test --flavor storagegrid
+python run_certification.py load --run-dir reports/my-test --flavor storagegrid --tier 1TB --duration-min 30
+python run_certification.py report --run-dir reports/my-test
+```
+
+Each step runs once per directory. To repeat a step, use a new directory.
+
+When you have finished with a run, delete its objects:
+
+```bash
+python run_certification.py cleanup --run-dir reports/my-test
+```
+
+## Clean up runs from before this version
+
+Earlier versions did not delete anything. Give `cleanup` every old run
+directory at once. It reads the bucket and the address from each run, so you
+only need the keys:
+
+```bash
+python run_certification.py cleanup --run-dir reports/run-a --run-dir reports/run-b --old-compat-objects
+```
+
+`--old-compat-objects` also removes the compatibility objects that older
+versions left in a shared `compat/` folder. It removes only names the tool
+generated, in the buckets those runs used.
 
 ## What lands in the run directory
 
 ```text
-manifest.json          # schema version, identity, stage status, settings, hashes
-compat.json/.md        # flavor attempts and the recommended Quickwit configuration
-fanout.json            # concurrent read measurements
-put-fanout.json        # concurrent write measurements
-ingest_merge.jsonl     # every ingest, merge and garbage-collection request
-query.jsonl            # every read, and each simulated query completion
-consistency.jsonl      # visibility probes
-report.html/.json/.md  # the report, written by the report step
-report-evidence/       # a copy of the evidence, for the download links
+manifest.json          what ran, when, with which settings
+compat.json, .md       the settings tried, and the ones picked
+fanout.json            read concurrency measurements
+put-fanout.json        write concurrency measurements
+ingest_merge.jsonl     every write, merge and delete request
+query.jsonl            every search read
+consistency.jsonl      the object visibility checks
+report.html, .json, .md   the report
+cleanup.json           what cleanup deleted, and anything it could not
+report-evidence/       a copy of the files above, for the report's download links
 ```
 
-Keep `report-evidence/` next to the HTML file to preserve its download links.
-The HTML still opens correctly on its own.
+Keep `report-evidence/` next to `report.html`, or the download links break.
 
 ## When something goes wrong
 
 | Message | What to do |
 |---|---|
-| `Missing connection settings` | Source your environment file, or pass the flags. The message names the variable for each missing setting. |
-| `No flavor passed every compatibility check` | Read `compat.md` in the run directory. It shows which check failed under which flavor. Fix the endpoint, or build a custom `storage.s3.*` configuration. |
-| `Stage ... already exists` | Each stage runs once per directory. Use a new `--run-dir`. |
-| `This run is active or was interrupted` | A `.running` lock file remains. Start a fresh directory rather than appending to interrupted measurements. |
-| `SSLError`, or `CERTIFICATE_VERIFY_FAILED` | The endpoint presents a certificate from a private authority. Pass `--ca-bundle /path/to/ca.pem`. Use `--insecure-skip-tls-verify` only to get unblocked; plain HTTP is a worse choice, because it does not measure the endpoint as it serves production traffic. |
-| `Too many open files`, or `allows N open files per process` | The concurrency sweep needs one socket per concurrent request. The tool raises the limit itself where the system allows it. If it cannot, run `ulimit -n 4096` in that shell, or lower the top level with `--levels 1,8,16,32,64,128`. |
+| `Missing connection settings` | Load your environment file, or pass the flags. The message names each missing variable. |
+| `--access-key is empty` | The shell variable you passed is not set. Check it with `echo`. |
+| `Could not connect to the endpoint, so no check ran` | Nothing was tested. Read the "Likely cause" line under the message. |
+| `SignatureDoesNotMatch` | The secret key does not belong to the access key. Check the "keys from" line at the start of the run. |
+| `InvalidToken` or `ExpiredToken` | Temporary keys need a valid session token. See [Where the keys come from](#where-the-keys-come-from). |
+| `SSLError` or `CERTIFICATE_VERIFY_FAILED` | Pass `--ca-bundle /path/to/ca.pem`. |
+| `No flavor passed every compatibility check` | The tool connected, but no known settings work. Open `compat.md` in the run directory to see which check failed. |
+| `Too many open files`, or `This machine ran out of open files` | A limit of your machine, not of the storage. The tool raises it by itself where it can. If it cannot, run `ulimit -n 4096` and start again. |
+| `The ... worker stopped: ...` | The workload stopped early. The message names the real cause. The measurements up to that point are kept, and `certify` still writes the report. |
+| `The test machine stopped for N seconds` (in the report) | The machine slept or was suspended during the run. Run again, and keep it awake. |
+| `Stage ... already exists` | Each step runs once per directory. Use a new `--run-dir`. |
+| `This run is active or was interrupted` | A previous run stopped early. Start a new directory. |
 
-An interrupted run keeps its partial evidence and records the stage as
-INTERRUPTED. You can still build a report from it.
+## See a report without running anything
 
-## Test the framework itself
-
-No credentials and no cloud charges. It runs against `moto`, an in-memory S3
-emulator.
+This writes an example report from made-up numbers. The page says that it is
+an example.
 
 ```bash
-pip install -r requirements-dev.txt
-pytest tests/ -v
 python examples/make_sample_report.py --out-dir reports/example
 ```
-
-The sample report shows the layout with synthetic numbers, and says so on the
-page.

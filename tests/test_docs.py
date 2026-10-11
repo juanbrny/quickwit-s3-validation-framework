@@ -62,7 +62,7 @@ def test_every_documented_command_works_as_written(doc, command, monkeypatch):
     # bucket from the run's own records, so it needs keys but no address.
     if args.cmd == "cleanup":
         assert args.access_key and args.secret_key
-    elif args.cmd != "report":
+    elif args.cmd not in ("report", "profile"):  # these read local files only
         require_connection(parser, args)  # a missing connection setting exits here
 
 

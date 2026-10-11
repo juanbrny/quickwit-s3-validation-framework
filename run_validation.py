@@ -387,6 +387,42 @@ def cleanup_run(run_dir, access_key, secret_key, session=None, verify_tls=True):
     return summary
 
 
+def cmd_profile(args, parser):
+    """Write the bundled AWS reference profile from a measured AWS run."""
+    import yaml
+
+    from src.reference_profile import (
+        DEFAULT_PROFILE, PROFILE_DIR, derive_profile, load_profile, render_profile,
+    )
+
+    values, errors, warnings = derive_profile(args.run_dir)
+    for warning in warnings:
+        print(f"Warning: {warning}", file=sys.stderr)
+    if errors:
+        parser.error(
+            "This run cannot give honest reference numbers: " + " ".join(errors)
+        )
+    out = Path(args.out or PROFILE_DIR / (DEFAULT_PROFILE + ".yaml"))
+    old = yaml.safe_load(out.read_text()) if out.exists() else {}
+    version = int(old.get("version", 0)) + 1
+    text = render_profile(values, old.get("id", DEFAULT_PROFILE), version)
+    out.write_text(text)
+    load_profile(str(out))  # refuse to leave a profile behind that will not load
+
+    def before(section, field):
+        return old.get(section, {}).get(field, "-")
+
+    print(f"Wrote {out}, version {version}, from run {values['run_id']}.")
+    print(f"  {'value':<24}{'before':>10}{'now':>10}")
+    for section, field in (
+        ("latency", "first_byte_p99_s"), ("latency", "fanout_tail_factor"),
+        ("throughput", "per_stream_mb_s"), ("throughput", "upload_per_stream_mb_s"),
+    ):
+        print(f"  {field:<24}{before(section, field)!s:>10}{values[field]!s:>10}")
+    print("Review the change with `git diff`, then commit it.")
+    return 0
+
+
 def cmd_cleanup(args, parser):
     if not args.access_key or not args.secret_key:
         parser.error(
@@ -988,6 +1024,18 @@ def build_parser():
     p.set_defaults(func=cmd_cleanup)
 
     p = sub.add_parser(
+        "profile",
+        help="Write the bundled AWS reference profile from a measured AWS run",
+        description="Reads a finished run against AWS S3, recorded from an EC2"
+        " instance in the bucket's region, and writes the reference profile"
+        " the report grades against. It refuses runs that cannot give honest"
+        " numbers.",
+    )
+    p.add_argument("--run-dir", required=True, help="A finished `validate` run against AWS S3.")
+    p.add_argument("--out", help="Profile file to write. Default: the bundled profile.")
+    p.set_defaults(func=cmd_profile)
+
+    p = sub.add_parser(
         "report",
         help="Build the HTML, JSON and Markdown report from a finished bundle",
         description="Reads only the recorded evidence. It needs no credentials and"
@@ -1012,6 +1060,8 @@ def main(argv=None):
             return cmd_report(args)
         if args.cmd == "cleanup":
             return cmd_cleanup(args, parser)
+        if args.cmd == "profile":
+            return cmd_profile(args, parser)
         require_connection(parser, args)
         keep_awake()
         describe_credentials(args, argv)

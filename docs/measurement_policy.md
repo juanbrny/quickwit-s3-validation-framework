@@ -128,7 +128,7 @@ Latency checks compare against AWS S3. There are two ways to supply that compari
 
 **Bundled reference profile (the default).** Most vendors have no AWS account. The framework therefore ships the bar it grades against, in `config/reference_profiles/`. Select one with `--reference <id>`, give a path to your own file, or pass `--reference none` to leave latency checks inconclusive.
 
-A profile holds two numbers, not a table of per-operation latencies:
+A profile holds a few numbers, not a table of per-operation latencies. The two that matter most:
 
 | Field | Meaning |
 |---|---|
@@ -146,7 +146,9 @@ limit      = reference x the operation's multiplier
 
 Two numbers therefore cover every operation and every tier, including tiers nobody has measured. A small read costs one round trip. An 8 GB mature split read costs about 91 seconds, where the round trip is a tenth of a percent.
 
-Queries are the exception. A query finishes when the slowest of its concurrent reads returns, and the 99th percentile of that maximum sits above the 99th percentile of one read. `latency.fanout_tail_factor` covers the difference. It is a stated assumption, not a measurement.
+Queries are the exception. A query finishes when the slowest of its concurrent reads returns, and the 99th percentile of that maximum sits above the 99th percentile of one read. `latency.fanout_tail_factor` covers the difference. In a provisional profile it is an assumption. In a profile written by `run_validation.py profile` it is measured: the p99 of whole searches, divided by the p99 of small reads.
+
+Uploads can be slower than downloads. A measured profile records `throughput.upload_per_stream_mb_s` for uploads. An older profile without it uses `per_stream_mb_s` for both. How to record a new profile is in [Run a validation](run_a_validation.md#refresh-the-aws-reference-profile).
 
 A profile also carries its provenance: storage class, runner, date and the sources behind its numbers. The report prints all of it. A profile marked `status: provisional` holds published figures rather than a run recorded with this framework, and the report says so.
 

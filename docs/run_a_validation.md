@@ -157,6 +157,47 @@ python run_validation.py validate --tier 1TB --duration-min 30 --with-aws-baseli
 
 The tool runs the same test against AWS S3, from the same machine, straight after the first one. `--runner-location` is a free label for where your machine is. Both runs must carry the same label, so give it every time.
 
+## Refresh the AWS reference profile
+
+Response times are graded against a reference profile of AWS S3, bundled with the tool. To replace its figures with your own measurement, record one run from inside AWS, then let the tool derive the profile from it.
+
+1. **Start an EC2 instance in the same region as an S3 bucket**, for example `us-east-1`. Pick one with high network bandwidth, for example `c5n.2xlarge`. A small instance limits the transfer speed, and the profile would describe the instance instead of S3.
+
+2. **On the instance, run the full validation against that bucket:**
+
+```bash
+export QW_S3_ENDPOINT=https://s3.us-east-1.amazonaws.com
+export QW_S3_REGION=us-east-1
+export QW_S3_BUCKET=your-aws-bucket
+export QW_S3_ACCESS_KEY=...
+export QW_S3_SECRET_KEY=...
+
+python run_validation.py validate --flavor aws --tier 1TB --duration-min 30 --runner-location "ec2 c5n.2xlarge us-east-1" --run-dir reports/aws-profile-run
+```
+
+3. **Copy the run directory back to your own machine**, for example with `scp -r`. Keep it: it is the evidence behind the new figures.
+
+4. **Write the profile from it:**
+
+```bash
+python run_validation.py profile --run-dir reports/aws-profile-run
+```
+
+The command prints each value before and after, and raises the profile's version. Review the change with `git diff`, then commit it.
+
+It refuses a run that cannot give honest figures: an endpoint that is not AWS S3, a step that did not finish, a machine that paused, or too few samples. It warns when small reads look too slow to come from inside the region.
+
+It measures four values:
+
+| Value | Measured as |
+|---|---|
+| `first_byte_p99_s` | The p99 of the small reads, 2 KiB and 8 KiB. |
+| `fanout_tail_factor` | The p99 of whole searches, divided by the small-read p99. |
+| `per_stream_mb_s` | The median speed of whole-file downloads, one stream each. |
+| `upload_per_stream_mb_s` | The median speed of uploads, one stream each. |
+
+Only transfers of at least 16 MiB count toward a speed. On a smaller transfer, the time after the first byte is too short to measure a speed from.
+
 ## Run the steps one by one
 
 Use this when you need to repeat one step, or run steps from different machines. Give every step the same `--run-dir`.

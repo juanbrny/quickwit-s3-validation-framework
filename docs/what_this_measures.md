@@ -1,25 +1,23 @@
 # What this tool measures
 
-One page. Read it before the report.
-
-## In one sentence
+## Introduction
 
 The tool copies how Datadog BYOC Logs (BYOC) uses storage. It runs that traffic against your storage system. Then it tells you if BYOC would work well on it.
 
-## Words used on this page
+## Glossary
 
-| Word | Meaning |
-|---|---|
-| BYOC | Datadog BYOC Logs: Datadog's log management that keeps your data in your own cloud account. It is built on the open-source Quickwit project, so these tests apply to Quickwit too. |
-| S3 | Simple Storage Service. The storage interface BYOC uses. |
-| AWS S3 | Amazon's own S3 service. Every other system is compared to it. |
-| Endpoint | The web address of the storage system under test. |
-| Check | One measurement with a pass or fail answer. |
-| p99 | The response time that 99 out of 100 requests are faster than. |
+| Term     | Meaning                                                                                                                                                                            |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| BYOC     | Datadog BYOC Logs: Datadog's log management that keeps your data in your own cloud account. It is built on the open-source Quickwit project, so these tests apply to Quickwit too. |
+| S3       | Simple Storage Service. The storage interface BYOC uses.                                                                                                                           |
+| AWS S3   | Amazon's own S3 service. Every other system is compared to it.                                                                                                                     |
+| Endpoint | The web address of the storage system under test.                                                                                                                                  |
+| Check    | One measurement with a pass or fail answer.                                                                                                                                        |
+| p99      | The response time that 99 out of 100 requests are faster than.                                                                                                                     |
 
-## The five questions
+## The five areas tested
 
-Every question has one command, one measurement, and one pass rule.
+Every area has one command, one measurement, and one pass rule.
 
 ### 1. Does the storage speak S3 the way BYOC needs?
 
@@ -68,10 +66,10 @@ Most customers sit between 1 TB and 1 PB per day. A 10 PB/day volume also exists
 
 This is a synthetic test, not a formal certification. It tests everything it can, and gives one of three results:
 
-| Result | Meaning |
-|---|---|
-| PASS | Every deciding check passed. |
-| FAIL | At least one deciding check failed. |
+| Result       | Meaning                                                                                   |
+| ------------ | ----------------------------------------------------------------------------------------- |
+| PASS         | Every deciding check passed.                                                              |
+| FAIL         | At least one deciding check failed.                                                       |
 | INCONCLUSIVE | Nothing failed, but at least one deciding check was not measured, or not measured enough. |
 
 A PASS can still need special storage settings. The report says so beside the result, and prints the settings to use.
@@ -106,17 +104,17 @@ Also outside this tool: whether data survives a failure, cost, and any volume or
 
 Nine checks decide the result. Each one answers part of a question above.
 
-| Check | Question |
-|---|---|
-| S3 compatibility | 1 |
-| Read concurrency | 2 |
-| Write concurrency | 2 |
-| Keeps up with writes | 3 |
-| Keeps up with searches | 3 |
-| Response time | 4 |
-| Failed requests | 5 |
-| Slowed-down requests | 5 |
-| Objects appear at once | 5 |
+| Check                  | Area |
+| ---------------------- | ---- |
+| S3 compatibility       | 1    |
+| Read concurrency       | 2    |
+| Write concurrency      | 2    |
+| Keeps up with writes   | 3    |
+| Keeps up with searches | 3    |
+| Response time          | 4    |
+| Failed requests        | 5    |
+| Slowed-down requests   | 5    |
+| Objects appear at once | 5    |
 
 Response time, failed requests and slowed-down requests each cover every operation. One check fails if any single operation fails. The report still shows every operation on its own row, so you can see which one.
 

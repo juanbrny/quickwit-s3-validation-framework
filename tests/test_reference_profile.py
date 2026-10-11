@@ -13,6 +13,7 @@ import pytest
 
 from src.reference_profile import (
     DEFAULT_PROFILE,
+    PROFILE_DIR,
     describe,
     load_profile,
     reference_p99,
@@ -112,3 +113,114 @@ def test_a_profile_missing_a_required_number_is_rejected(tmp_path):
     )
     with pytest.raises(ValueError, match="throughput.per_stream_mb_s"):
         load_profile(str(path))
+
+
+# ---- deriving the profile from a measured AWS run --------------------------
+
+import json
+import random
+
+import yaml
+
+from src.reference_profile import derive_profile, render_profile
+
+MIB = 1024 * 1024
+
+
+def _aws_run(tmp_path, download_mib_s=90.0, upload_mib_s=70.0, small_p50=0.020,
+             endpoint="https://s3.us-east-1.amazonaws.com", pauses=None):
+    """A finished AWS run with known speeds, so the derived numbers are checkable."""
+    from examples.make_sample_report import make_bundle
+    from src.run_store import digest, read_json, write_json
+
+    run = make_bundle(tmp_path / "aws", True)
+    rng = random.Random(7)
+    t = 1_000_000.0
+    query = []
+    for i in range(3000):
+        latency = small_p50 * (1 + rng.expovariate(1 / 0.15))
+        query.append({"ts": t + i, "worker": "searcher", "op": "get_term_or_field" if i % 2 else "get_doc",
+                      "ok": True, "latency_s": latency, "bytes": 8192, "error": None})
+    for i in range(200):
+        query.append({"ts": t + i, "worker": "searcher", "op": "query_wall_clock", "ok": True,
+                      "latency_s": small_p50 * (2 + rng.random()), "bytes": 0, "error": None})
+    size = 132 * MIB
+    ingest = []
+    for i in range(40):
+        for op, rate in (("get_object_full", download_mib_s), ("put_object", upload_mib_s)):
+            ingest.append({"ts": t + i, "worker": "indexer-0", "op": op, "ok": True,
+                           "latency_s": small_p50 + size / MIB / rate, "bytes": size, "error": None})
+    (run / "query.jsonl").write_text("".join(json.dumps(r) + "\n" for r in query))
+    (run / "ingest_merge.jsonl").write_text("".join(json.dumps(r) + "\n" for r in ingest))
+    manifest = read_json(run / "manifest.json")
+    manifest["identity"]["endpoint"] = endpoint
+    load = manifest["stages"]["load"]
+    load["options"]["flavor"] = "aws"
+    load["options"]["runner_location"] = "ec2 c5n.2xlarge us-east-1a"
+    if pauses:
+        load["pauses"] = pauses
+    for name in ("query.jsonl", "ingest_merge.jsonl"):
+        load["artifacts"][name] = digest(run / name)
+    write_json(run / "manifest.json", manifest)
+    return run
+
+
+def test_the_profile_recovers_the_speeds_of_a_known_run(tmp_path):
+    values, errors, warnings = derive_profile(_aws_run(tmp_path))
+    assert errors == [] and warnings == []
+    assert values["per_stream_mb_s"] == pytest.approx(90.0, rel=0.01)
+    assert values["upload_per_stream_mb_s"] == pytest.approx(70.0, rel=0.01)
+    assert 0.020 < values["first_byte_p99_s"] < 0.2
+    assert values["fanout_tail_factor"] > 0
+
+
+def test_a_written_profile_loads_and_grades_uploads_with_their_own_speed(tmp_path):
+    values, _, _ = derive_profile(_aws_run(tmp_path, download_mib_s=90.0, upload_mib_s=45.0))
+    path = tmp_path / "profile.yaml"
+    path.write_text(render_profile(values, version=2))
+    profile = load_profile(str(path))
+    assert profile["status"] == "published" and profile["version"] == 2
+    size = 100 * MIB
+    download = reference_p99(profile, "get_object_full", size)
+    upload = reference_p99(profile, "put_object", size)
+    assert upload > download  # 45 MiB/s up is slower than 90 MiB/s down
+
+
+@pytest.mark.parametrize("change,message", [
+    (dict(endpoint="http://192.168.0.10:10444"), "not AWS S3"),
+    (dict(pauses=[{"started_epoch": 1.0, "seconds": 90}]), "paused"),
+])
+def test_runs_that_cannot_give_honest_numbers_are_refused(tmp_path, change, message):
+    values, errors, _ = derive_profile(_aws_run(tmp_path, **change))
+    assert values is None
+    assert any(message in e for e in errors)
+
+
+def test_a_runner_outside_the_region_is_flagged(tmp_path):
+    """From a laptop, small reads took 140 ms in the median; in region, about 20."""
+    _, errors, warnings = derive_profile(_aws_run(tmp_path, small_p50=0.140))
+    assert errors == []
+    assert any("outside" in w for w in warnings)
+
+
+def test_small_transfers_are_never_used_to_measure_speed(tmp_path):
+    """A small transfer finishes at first-byte speed: dividing by its tiny
+    remaining time once gave an upload speed of 2,879 MiB/s."""
+    from examples.make_sample_report import make_bundle
+
+    values, errors, _ = derive_profile(make_bundle(tmp_path / "sample", True))
+    assert values is None
+    assert any("large downloads" in e for e in errors)
+
+
+def test_the_profile_command_raises_the_version(tmp_path, capsys):
+    from run_validation import main
+
+    out = tmp_path / "aws-s3-ec2-same-region.yaml"
+    out.write_text((PROFILE_DIR / "aws-s3-ec2-same-region.yaml").read_text())
+    before = yaml.safe_load(out.read_text())["version"]
+    assert main(["profile", "--run-dir", str(_aws_run(tmp_path)), "--out", str(out)]) == 0
+    written = load_profile(str(out))
+    assert written["version"] == before + 1
+    assert written["status"] == "published"
+    assert "first_byte_p99_s" in capsys.readouterr().out

@@ -84,9 +84,14 @@ def reference_p99(profile, op, median_bytes):
         return latency * profile["latency"]["fanout_tail_factor"]
     if not isinstance(median_bytes, (int, float)) or median_bytes <= 0:
         return latency
-    throughput = profile["throughput"]["per_stream_mb_s"] * 1024 * 1024
+    rates = profile["throughput"]
     if op in UPLOAD_OPS:
-        throughput *= _upload_streams(profile, median_bytes)
+        # Uploads and downloads can differ. A measured profile records both;
+        # an older one has only the download speed, which then serves both.
+        stream = rates.get("upload_per_stream_mb_s", rates["per_stream_mb_s"])
+        throughput = stream * 1024 * 1024 * _upload_streams(profile, median_bytes)
+    else:
+        throughput = rates["per_stream_mb_s"] * 1024 * 1024
     return latency + median_bytes / throughput
 
 
@@ -114,3 +119,198 @@ def describe(profile):
         "latency": profile.get("latency", {}),
         "throughput": profile.get("throughput", {}),
     }
+
+
+# ---- deriving a profile from a measured AWS run ----------------------------
+#
+# The bundled profile started from published AWS figures. `derive_profile()`
+# replaces them with a run recorded by this tool, from an EC2 instance in the
+# same region as the bucket. Each number measures exactly what the model uses
+# it for:
+#
+#   first_byte_p99_s       p99 of the small reads (2 KiB and 8 KiB)
+#   fanout_tail_factor     search p99 / small-read p99
+#   per_stream_mb_s        median speed of whole-file downloads, one stream each
+#   upload_per_stream_mb_s median speed of single-stream uploads
+#
+# Speeds use the time after the first byte: each transfer's latency minus the
+# median small-read latency, which is the typical time to the first byte.
+
+SMALL_READS = ("get_term_or_field", "get_doc")
+DOWNLOADS = ("get_object_full",)
+MIN_SAMPLES = {"small reads": 100, "searches": 100, "downloads": 10, "uploads": 10}
+IN_REGION_MEDIAN_S = 0.050  # a small read from inside the region is far faster
+# A speed is only measured from a transfer where moving the bytes takes most
+# of the time. On a small transfer the time after the first byte is nearly
+# zero, and dividing by it gives absurd speeds.
+LARGE_TRANSFER_MIB = 16
+TRANSFER_DOMINATES = 3.0  # transfer time at least 3x the first-byte time
+
+
+def _percentile(values, pct):
+    from .report import _percentile as percentile
+
+    return percentile(sorted(values), pct)
+
+
+def derive_profile(run_dir):
+    """Measure the profile's numbers from one AWS run.
+
+    Returns (values, errors, warnings). An error means the run cannot give
+    honest numbers, and no profile should be written from it.
+    """
+    import json
+
+    from .run_store import load_bundle
+
+    run_dir = Path(run_dir)
+    manifest, issues = load_bundle(run_dir)
+    load = manifest["stages"].get("load", {})
+    errors, warnings = list(issues), []
+    host = manifest["identity"]["endpoint"].split("//")[-1].split("/")[0].split(":")[0]
+    if not host.endswith((".amazonaws.com", ".amazonaws.com.cn")):
+        errors.append(f"The endpoint {host} is not AWS S3.")
+    if load.get("status") != "COMPLETED":
+        errors.append("The workload step did not complete.")
+    if load.get("options", {}).get("flavor") not in ("none", "aws"):
+        errors.append("The run did not use AWS S3's default settings (flavor aws).")
+    if load.get("pauses"):
+        errors.append("The test machine paused during the run.")
+
+    rows = []
+    for name in ("ingest_merge.jsonl", "query.jsonl"):
+        file = run_dir / name
+        if file.exists():
+            rows += [json.loads(line) for line in file.read_text().splitlines() if line.strip()]
+    ok = [r for r in rows if r.get("ok")]
+    failed = len(rows) - len(ok)
+    if rows and failed / len(rows) > 0.001:
+        warnings.append(f"{failed} of {len(rows)} requests failed; AWS S3 rarely fails.")
+
+    small = [r["latency_s"] for r in ok if r["op"] in SMALL_READS]
+    searches = [r["latency_s"] for r in ok if r["op"] == "query_wall_clock"]
+    part = 5 * 1024 ** 3
+    small_p50 = _percentile(small, 50) if small else 0.0
+
+    def large(r):
+        return (
+            r.get("bytes", 0) >= LARGE_TRANSFER_MIB * 1024 * 1024
+            and r["latency_s"] - small_p50 >= TRANSFER_DOMINATES * small_p50
+        )
+
+    downloads = [r for r in ok if r["op"] in DOWNLOADS and large(r)]
+    uploads = [
+        r for r in ok
+        if r["op"] in UPLOAD_OPS and large(r) and r["bytes"] <= part  # one stream
+    ]
+    counts = {"small reads": len(small), "searches": len(searches),
+              "downloads": len(downloads), "uploads": len(uploads)}
+    for name, need in MIN_SAMPLES.items():
+        if counts[name] < need:
+            kind = f"large {name} (at least {LARGE_TRANSFER_MIB} MiB)" if name in ("downloads", "uploads") else name
+            errors.append(f"Only {counts[name]} {kind}; at least {need} are needed.")
+    if errors:
+        return None, errors, warnings
+
+    first_byte_p99 = _percentile(small, 99)
+    first_byte_p50 = _percentile(small, 50)
+    if first_byte_p50 > IN_REGION_MEDIAN_S:
+        warnings.append(
+            f"Small reads take {first_byte_p50 * 1000:.0f} ms in the median. From inside"
+            " the bucket's region they take about 20 ms, so this runner is probably"
+            " outside it."
+        )
+
+    def speed(transfers):
+        rates = [
+            r["bytes"] / (1024 * 1024) / (r["latency_s"] - first_byte_p50)
+            for r in transfers
+            if r["latency_s"] > first_byte_p50
+        ]
+        return _percentile(rates, 50) if rates else None
+
+    values = {
+        "first_byte_p99_s": round(first_byte_p99, 4),
+        "fanout_tail_factor": round(_percentile(searches, 99) / first_byte_p99, 2),
+        "per_stream_mb_s": round(speed(downloads), 1),
+        "upload_per_stream_mb_s": round(speed(uploads), 1),
+        "counts": counts,
+        "small_read_p50_s": round(first_byte_p50, 4),
+        "run_id": manifest["run_id"],
+        "region": manifest["identity"]["region"],
+        "runner": load.get("options", {}).get("runner_location", "unspecified"),
+        "tier": load.get("options", {}).get("tier"),
+        "duration_min": load.get("options", {}).get("duration_min"),
+        "measured_at": load.get("finished_at"),
+        "tool_commit": load.get("environment", {}).get("commit", "unknown"),
+    }
+    return values, errors, warnings
+
+
+PROFILE_TEMPLATE = """\
+# Bundled AWS S3 reference profile.
+#
+# A vendor does not need an Amazon Web Services (AWS) account to get a result.
+# This file is the bar the tool grades against when no measured baseline is
+# supplied. It was written by `run_validation.py profile` from a run recorded
+# with this tool. To refresh it, record a new run and run that command again.
+
+id: {id}
+version: {version}
+status: published
+title: AWS S3 Standard, read from an EC2 instance in the same region
+
+context:
+  storage_class: S3 Standard
+  runner: "{runner}"
+  region: {region}
+  measured_at: "{measured_at}"
+  run_id: {run_id}
+  tool_commit: "{tool_commit}"
+  tier: {tier}
+  duration_min: {duration_min}
+  source: Measured with this tool, then derived with run_validation.py profile.
+  samples:
+    small_reads: {small_reads}
+    searches: {searches}
+    downloads: {downloads}
+    uploads: {uploads}
+  references:
+    - "AWS S3 best practices whitepaper. Make one concurrent request for each 85-90 MB/s of desired network throughput."
+    - "dvassallo/s3-benchmark, 155 instance types. The 90th percentile time to first byte is around 20 ms from an in-region EC2 instance, and one thread moves about 93 MB/s."
+
+latency:
+  # The 99th percentile (p99) of the {small_reads} small reads (2 KiB and 8 KiB).
+  # The median was {small_read_p50_ms} ms.
+  first_byte_p99_s: {first_byte_p99_s}
+
+  # A search ends when its slowest read returns. Measured as the p99 of
+  # {searches} searches, divided by the small-read p99.
+  fanout_tail_factor: {fanout_tail_factor}
+
+throughput:
+  # Median speed of {downloads} whole-file downloads, one stream each, in MiB/s.
+  per_stream_mb_s: {per_stream_mb_s}
+
+  # Median speed of {uploads} single-stream uploads, in MiB/s.
+  upload_per_stream_mb_s: {upload_per_stream_mb_s}
+
+  # BYOC uploads above 128 MiB as multipart, with a 5 GiB target part size,
+  # and sends the parts at the same time.
+  multipart_threshold_mb: 128
+  multipart_part_gb: 5
+  max_concurrent_parts: 10
+"""
+
+
+def render_profile(values, profile_id=DEFAULT_PROFILE, version=1):
+    return PROFILE_TEMPLATE.format(
+        id=profile_id,
+        version=version,
+        small_read_p50_ms=round(values["small_read_p50_s"] * 1000),
+        small_reads=values["counts"]["small reads"],
+        searches=values["counts"]["searches"],
+        downloads=values["counts"]["downloads"],
+        uploads=values["counts"]["uploads"],
+        **{k: v for k, v in values.items() if k != "counts"},
+    )

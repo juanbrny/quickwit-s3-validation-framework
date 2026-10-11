@@ -6,7 +6,7 @@ Every command for running the tool is on this page, and only here. To understand
 
 - Python 3.9 or later.
 - A bucket on the storage system you want to test. The run writes and deletes objects under the `qwcert/` prefix.
-- An access key and a secret key that can read, write and delete in that bucket.
+- An access key and a secret key that can read, write and delete in that bucket. See [Permissions](#permissions) for the exact list.
 
 You do not need an Amazon Web Services (AWS) account. The tool compares your storage with published AWS S3 figures. If you do have an AWS account, you can measure AWS yourself. See [Compare with your own AWS run](#compare-with-your-own-aws-run).
 
@@ -14,6 +14,43 @@ You do not need an Amazon Web Services (AWS) account. The tool compares your sto
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
+
+### Permissions
+
+The keys need these S3 permissions. Object permissions can be limited to the `qwcert/` folder, where every test object lives. On AWS, this is the IAM policy:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:ListBucketMultipartUploads",
+        "s3:ListBucketVersions",
+        "s3:GetBucketVersioning"
+      ],
+      "Resource": "arn:aws:s3:::your-test-bucket"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:DeleteObjectVersion",
+        "s3:AbortMultipartUpload"
+      ],
+      "Resource": "arn:aws:s3:::your-test-bucket/qwcert/*"
+    }
+  ]
+}
+```
+
+Without `s3:ListBucketMultipartUploads`, the test still runs, and cleanup still deletes every object. Cleanup only cannot check for unfinished multipart uploads, and says so. Add `s3:CreateBucket` only if the bucket does not exist yet. To remove objects from older versions of the tool with `--old-compat-objects`, also allow the object permissions on `your-test-bucket/compat/*`.
+
+Most S3-compatible storage systems use the same permission names in their own access policies.
 
 ## Step 1: set the connection
 
@@ -172,8 +209,10 @@ export QW_S3_BUCKET=your-aws-bucket
 export QW_S3_ACCESS_KEY=...
 export QW_S3_SECRET_KEY=...
 
-python run_validation.py validate --flavor aws --tier 1TB --duration-min 30 --runner-location "ec2 c5n.2xlarge us-east-1" --run-dir reports/aws-profile-run
+python run_validation.py validate --flavor aws --tier 100GB --duration-min 30 --runner-location "ec2 c5n.2xlarge us-east-1" --run-dir reports/aws-profile-run
 ```
+
+Use the `100GB` tier. At `1TB`, one Python process sends about 300 requests per second, and it slows down every request it sends. The profile would then describe the test machine, not S3.
 
 3. **Copy the run directory back to your own machine**, for example with `scp -r`. Keep it: it is the evidence behind the new figures.
 
@@ -185,7 +224,16 @@ python run_validation.py profile --run-dir reports/aws-profile-run
 
 The command prints each value before and after, and raises the profile's version. Review the change with `git diff`, then commit it.
 
-It refuses a run that cannot give honest figures: an endpoint that is not AWS S3, a step that did not finish, a machine that paused, or too few samples. It warns when small reads look too slow to come from inside the region.
+It refuses a run that cannot give honest figures:
+
+- the endpoint is not AWS S3;
+- a step did not finish;
+- the machine paused;
+- there are too few samples;
+- small reads were more than twice as slow during the workload as in the idle read test, so the test machine was overloaded;
+- the run sent less than 90% of the searches per second its tier asks for.
+
+It warns when small reads look too slow to come from inside the region.
 
 It measures four values:
 

@@ -290,10 +290,12 @@ def render_html(report, links=None):
         parts.append("</section>")
     groups = report.get("groups", [])
     if groups:
+        # Counted, not written: a hard-coded "ten" outlived the check it named.
+        deciding = sum(1 for c in report["checks"] if c["required"])
         parts.append(
-            '<section id="summary"><h2>The five questions</h2><p>Each question'
-            " answers with the worst result among its own checks. Ten checks"
-            " decide the result. The rest are information only.</p>"
+            '<section id="summary"><h2>The five areas tested</h2><p>Each area'
+            " answers with the worst result among its own checks."
+            f" {deciding} checks decide the result. The rest are information only.</p>"
             '<div class="questions">'
         )
         for group in groups:
@@ -842,7 +844,7 @@ def render_markdown(report):
         lines += [f"**{item['title']}.** {item['detail']}", ""]
     groups = report.get("groups", [])
     if groups:
-        lines += ["## The five questions", "", "| Question | Answer | Checks |",
+        lines += ["## The five areas tested", "", "| Area | Answer | Checks |",
                    "|---|---|---|"]
         for group in groups:
             counts = ", ".join(

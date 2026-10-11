@@ -37,7 +37,7 @@ LATER_STAGE = [
                " search."},
 ]
 
-# The five questions in docs/what_this_measures.md, in the same order and the
+# The five areas in docs/what_this_measures.md, in the same order and the
 # same words. The report and that page must never drift apart. A sixth
 # section covers whether the run itself can be trusted. Its checks never
 # decide the result; they make an affected result inconclusive instead.

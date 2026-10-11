@@ -128,7 +128,8 @@ MIB = 1024 * 1024
 
 
 def _aws_run(tmp_path, download_mib_s=90.0, upload_mib_s=70.0, small_p50=0.020,
-             endpoint="https://s3.us-east-1.amazonaws.com", pauses=None):
+             endpoint="https://s3.us-east-1.amazonaws.com", pauses=None,
+             idle_p50=0.025, searches=2000):
     """A finished AWS run with known speeds, so the derived numbers are checkable."""
     from examples.make_sample_report import make_bundle
     from src.run_store import digest, read_json, write_json
@@ -141,7 +142,7 @@ def _aws_run(tmp_path, download_mib_s=90.0, upload_mib_s=70.0, small_p50=0.020,
         latency = small_p50 * (1 + rng.expovariate(1 / 0.15))
         query.append({"ts": t + i, "worker": "searcher", "op": "get_term_or_field" if i % 2 else "get_doc",
                       "ok": True, "latency_s": latency, "bytes": 8192, "error": None})
-    for i in range(200):
+    for i in range(searches):  # the sample run lasts 180 s at a target of 10 per second
         query.append({"ts": t + i, "worker": "searcher", "op": "query_wall_clock", "ok": True,
                       "latency_s": small_p50 * (2 + rng.random()), "bytes": 0, "error": None})
     size = 132 * MIB
@@ -159,6 +160,13 @@ def _aws_run(tmp_path, download_mib_s=90.0, upload_mib_s=70.0, small_p50=0.020,
     load["options"]["runner_location"] = "ec2 c5n.2xlarge us-east-1a"
     if pauses:
         load["pauses"] = pauses
+    # The idle read test: the same small reads with nothing else running.
+    fanout = read_json(run / "fanout.json")
+    for level in fanout["levels"]:
+        if level["concurrency"] == 1:
+            level["p50_per_request_s"] = idle_p50
+    write_json(run / "fanout.json", fanout)
+    manifest["stages"]["fanout"]["artifacts"]["fanout.json"] = digest(run / "fanout.json")
     for name in ("query.jsonl", "ingest_merge.jsonl"):
         load["artifacts"][name] = digest(run / name)
     write_json(run / "manifest.json", manifest)
@@ -198,7 +206,7 @@ def test_runs_that_cannot_give_honest_numbers_are_refused(tmp_path, change, mess
 
 def test_a_runner_outside_the_region_is_flagged(tmp_path):
     """From a laptop, small reads took 140 ms in the median; in region, about 20."""
-    _, errors, warnings = derive_profile(_aws_run(tmp_path, small_p50=0.140))
+    _, errors, warnings = derive_profile(_aws_run(tmp_path, small_p50=0.140, idle_p50=0.130))
     assert errors == []
     assert any("outside" in w for w in warnings)
 
@@ -224,3 +232,22 @@ def test_the_profile_command_raises_the_version(tmp_path, capsys):
     assert written["version"] == before + 1
     assert written["status"] == "published"
     assert "first_byte_p99_s" in capsys.readouterr().out
+
+
+def test_an_overloaded_test_machine_is_refused(tmp_path):
+    """
+    Recorded on an m5a.8xlarge in us-east-1 at 1 TB/day: small reads took 30 ms
+    with nothing else running, and 71 ms during the workload. One Python process
+    could not send 294 requests per second without slowing every one of them.
+    A profile from that run would have been about 20 times too lenient.
+    """
+    values, errors, _ = derive_profile(_aws_run(tmp_path, small_p50=0.071, idle_p50=0.030))
+    assert values is None
+    assert any("overloaded" in e for e in errors)
+
+
+def test_a_run_that_missed_its_search_rate_is_refused(tmp_path):
+    """The same run reached 5.7 searches per second of the 10 it should send."""
+    values, errors, _ = derive_profile(_aws_run(tmp_path, searches=1000))
+    assert values is None
+    assert any("could not generate its own workload" in e for e in errors)

@@ -140,6 +140,12 @@ SMALL_READS = ("get_term_or_field", "get_doc")
 DOWNLOADS = ("get_object_full",)
 MIN_SAMPLES = {"small reads": 100, "searches": 100, "downloads": 10, "uploads": 10}
 IN_REGION_MEDIAN_S = 0.050  # a small read from inside the region is far faster
+# A single test process can only send so many requests before its own work
+# slows every request down. Small reads during the workload may then take far
+# longer than the same reads with nothing else running. Past this factor, the
+# figures describe the test machine, not S3.
+OVERLOAD_FACTOR = 2.0
+SEARCH_RATE_MIN = 0.9  # the run must reach 90% of its search rate target
 # A speed is only measured from a transfer where moving the bytes takes most
 # of the time. On a small transfer the time after the first byte is nearly
 # zero, and dividing by it gives absurd speeds.
@@ -214,12 +220,38 @@ def derive_profile(run_dir):
 
     first_byte_p99 = _percentile(small, 99)
     first_byte_p50 = _percentile(small, 50)
-    if first_byte_p50 > IN_REGION_MEDIAN_S:
-        warnings.append(
-            f"Small reads take {first_byte_p50 * 1000:.0f} ms in the median. From inside"
-            " the bucket's region they take about 20 ms, so this runner is probably"
-            " outside it."
+
+    # The read concurrency test sends small reads with nothing else running.
+    # Its single-request median is what S3 answers when the client is idle.
+    idle = None
+    fanout = run_dir / "fanout.json"
+    if fanout.exists():
+        levels = json.loads(fanout.read_text()).get("levels", [])
+        idle = next((lv.get("p50_per_request_s") for lv in levels if lv.get("concurrency") == 1), None)
+    if idle and first_byte_p50 > OVERLOAD_FACTOR * idle:
+        errors.append(
+            f"The test machine was overloaded. Small reads took {first_byte_p50 * 1000:.0f} ms"
+            f" in the median during the workload, and {idle * 1000:.0f} ms with nothing else"
+            " running. The figures would describe the test machine, not S3. Run a"
+            " lighter workload, for example --tier 100GB."
         )
+    target = load.get("op_mix", {}).get("query_qps")
+    seconds = load.get("measurement_duration_s")
+    if target and seconds and len(searches) / seconds < SEARCH_RATE_MIN * target:
+        errors.append(
+            f"The run reached {len(searches) / seconds:.1f} searches per second of the"
+            f" {target:g} it should send, so it could not generate its own workload."
+            " Run a lighter workload, for example --tier 100GB."
+        )
+    reference = idle or first_byte_p50
+    if reference > IN_REGION_MEDIAN_S:
+        warnings.append(
+            f"Small reads take {reference * 1000:.0f} ms in the median with nothing else"
+            " running. From inside the bucket's region they take about 20 to 30 ms, so"
+            " this runner is probably outside it."
+        )
+    if errors:
+        return None, errors, warnings
 
     def speed(transfers):
         rates = [

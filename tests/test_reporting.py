@@ -674,7 +674,7 @@ def test_stage_aliases_keep_working(moto_server_endpoint, tmp_path):
 
 def test_every_check_belongs_to_one_question(bundle):
     """
-    The report must show the same five questions as
+    The report must show the same five areas as
     docs/what_this_measures.md, and every check must sit under one of them.
     A check with no question would never appear on the page.
     """
@@ -1273,3 +1273,28 @@ def test_the_storagegrid_uploads_fail_on_their_median():
     status, note = latency_result(30, 2.610, 2.458, 2.610, limit=0.745, minimum=100)
     assert status == "FAIL"
     assert "median is over the limit" in note
+
+
+def test_the_report_uses_the_page_s_own_section_title(bundle):
+    """
+    docs/what_this_measures.md and the report must use the same words. The
+    page renamed "The five questions" to "The five areas tested", and the
+    report kept the old title. This reads the title from the page itself.
+    """
+    page = (Path(__file__).resolve().parent.parent / "docs" / "what_this_measures.md").read_text()
+    title = next(
+        line[3:].strip() for line in page.splitlines()
+        if line.startswith("## The five ")
+    )
+    report = build_report(bundle)
+    assert f"<h2>{title}</h2>" in render_html(report)
+    assert f"## {title}" in render_markdown(report)
+
+
+def test_the_report_counts_its_deciding_checks_instead_of_stating_them(bundle):
+    """A written-in "Ten checks decide the result" outlived the tenth check."""
+    report = build_report(bundle)
+    deciding = sum(1 for c in report["checks"] if c["required"])
+    html = render_html(report)
+    assert f"{deciding} checks decide the result" in html
+    assert "Ten checks" not in html

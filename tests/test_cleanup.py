@@ -146,3 +146,56 @@ def test_old_compat_objects_are_removed_only_when_their_name_matches(moto_server
     result = clean_old_compat_objects(_client(moto_server_endpoint), "legacy")
     assert result["old_compat_objects_deleted"] == 3
     assert sorted(_keys(s3, "legacy")) == sorted(look_alikes)
+
+
+def _deny_listing_uploads(client):
+    """Keys that may delete objects, but not list unfinished multipart uploads."""
+    from botocore.exceptions import ClientError
+
+    real = client._client.get_paginator
+
+    def get_paginator(name):
+        if name == "list_multipart_uploads":
+            class Denied:
+                def paginate(self, **kwargs):
+                    raise ClientError({"Error": {"Code": "AccessDenied"}}, "ListMultipartUploads")
+            return Denied()
+        return real(name)
+
+    client._client.get_paginator = get_paginator
+    return client
+
+
+def test_a_missing_permission_to_list_uploads_does_not_fail_the_cleanup(moto_server_endpoint):
+    """
+    Every AWS run reported "Cleanup incomplete ... AccessDenied. Run cleanup
+    again", although all 587 objects were gone. Running it again could never
+    help: the keys still lacked the permission.
+    """
+    from src.cleanup import describe
+
+    s3 = _s3(moto_server_endpoint)
+    s3.create_bucket(Bucket="denied")
+    for i in range(3):
+        s3.put_object(Bucket="denied", Key=f"qwcert/{RUN}/file-{i}", Body=b"x")
+    summary = clean_run(_deny_listing_uploads(_client(moto_server_endpoint)), "denied", RUN)
+    assert summary["objects_deleted"] == 3 and summary["objects_left"] == 0
+    assert summary["complete"] is True
+    assert summary["errors"] == []
+    message = describe(summary)
+    assert "Nothing is left" in message
+    assert "s3:ListBucketMultipartUploads" in message
+    assert "again" not in message
+
+
+def test_a_retry_is_suggested_only_when_it_can_help():
+    from src.cleanup import describe
+
+    base = dict(prefix=f"qwcert/{RUN}/", objects_deleted=0, bytes_deleted=0,
+                multipart_uploads_aborted=0, versions_deleted=0, objects_left=4,
+                complete=False, not_checked=[])
+    denied = describe(dict(base, errors=["AccessDenied"]))
+    assert "will not help" in denied
+    flaky = describe(dict(base, errors=["EndpointConnectionError"]))
+    assert "Run `cleanup` again to finish." in flaky
+    assert "Errors: EndpointConnectionError." in flaky  # sentences end with a full stop

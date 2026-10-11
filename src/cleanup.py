@@ -41,6 +41,14 @@ def run_prefix(run_id: str) -> str:
     return f"qwcert/{run_id}/"
 
 
+# Error codes that mean "these keys may not do this". Retrying cannot fix them.
+PERMISSION_CODES = ("AccessDenied", "AllAccessDisabled", "Forbidden", "403")
+
+
+def is_permission_error(text) -> bool:
+    return any(code in str(text) for code in PERMISSION_CODES)
+
+
 def _error(error) -> str:
     if isinstance(error, ClientError):
         return error.response.get("Error", {}).get("Code", type(error).__name__)
@@ -66,7 +74,15 @@ def _abort_uploads(client, bucket, prefix, summary):
                 )
                 summary["multipart_uploads_aborted"] += 1
     except (ClientError, BotoCoreError) as error:
-        summary["errors"].append(f"listing unfinished multipart uploads: {_error(error)}")
+        if is_permission_error(_error(error)):
+            # The objects can still all be gone. This only means nobody can
+            # say whether an unfinished upload remains, and the tool cancels
+            # its own failed uploads, so normally none does.
+            summary["not_checked"].append(
+                "unfinished multipart uploads (needs s3:ListBucketMultipartUploads)"
+            )
+        else:
+            summary["errors"].append(f"listing unfinished multipart uploads: {_error(error)}")
 
 
 def _delete_objects(client, bucket, prefix, summary):
@@ -127,6 +143,7 @@ def clean_run(client: QwS3Client, bucket: str, run_id: str) -> dict:
         "versions_deleted": 0,
         "objects_left": None,
         "errors": [],
+        "not_checked": [],
     }
     try:
         _abort_uploads(client, bucket, prefix, summary)
@@ -150,15 +167,31 @@ def describe(summary: dict) -> str:
         line += f", aborted {summary['multipart_uploads_aborted']} unfinished uploads"
     if summary["versions_deleted"]:
         line += f", removed {summary['versions_deleted']} old versions"
+    not_checked = summary.get("not_checked") or []
     if summary["complete"]:
-        return "Cleanup " + line + ". Nothing is left."
+        text = "Cleanup " + line + ". Nothing is left."
+        if not_checked:
+            text += (
+                " It could not check for " + "; ".join(not_checked) + ", because"
+                " these keys lack that permission. The tool cancels its own failed"
+                " uploads, so normally there are none. To be sure, grant the"
+                " permission, or give the bucket a lifecycle rule that removes"
+                " incomplete multipart uploads."
+            )
+        return text
     left = summary["objects_left"]
-    return (
+    errors = summary["errors"]
+    text = (
         "Cleanup incomplete: " + line + "."
         + (f" {left} objects are still there." if left else "")
-        + (" Errors: " + "; ".join(summary["errors"][:3]) if summary["errors"] else "")
-        + " Run `cleanup` again to finish."
+        + (" Errors: " + "; ".join(errors[:3]) + "." if errors else "")
     )
+    if errors and all(is_permission_error(e) for e in errors):
+        return text + (
+            " These keys lack the permission for it, so running cleanup again will"
+            " not help. Grant the permission, then run `cleanup` again."
+        )
+    return text + " Run `cleanup` again to finish."
 
 
 # Before every object lived in its run's folder, the compatibility checks

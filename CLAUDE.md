@@ -10,12 +10,12 @@ Do not hard-wrap Markdown. Write each paragraph and each list item on one line, 
 
 The report uses Datadog purple (`--brand: #632ca6`, `--brand-dark: #2b124c`) for brand elements and for the measured series in charts. Reference lines (targets, minimums, limits) are dashed neutral grey, never a second hue. Status colours (PASS green, FAIL red, INCONCLUSIVE amber, NOT RUN grey) are reserved for status and are never brand colours. Chart colours were checked with the dataviz validator, and text pairs for 4.5:1 contrast; re-check any change.
 
-`docs/what_this_measures.md` is the definition the code must match: five questions, nine deciding checks. If the code and that page disagree, the page wins. Change the page first, with the user's agreement, then the code.
+`docs/what_this_measures.md` is the definition the code must match: five areas tested, nine deciding checks. If the code and that page disagree, the page wins. Change the page first, with the user's agreement, then the code.
 
 Each document has one job. Do not repeat content across them:
 
 - `README.md` — entry point. One starter command, and a map of the documents.
-- `docs/what_this_measures.md` — the five questions, the nine checks, and what is tested at a later stage.
+- `docs/what_this_measures.md` — the five areas tested, the nine checks, and what is tested at a later stage.
 - `docs/run_a_validation.md` — every command, and the only place with commands.
 - `docs/read_the_report.md` — what the report shows, section by section.
 - `docs/measurement_policy.md` — exact rules and numbers, for reviewers.
@@ -29,7 +29,7 @@ Write in simple English for non-native readers: one idea per sentence, short sen
 
 Connection settings fall back to environment variables (`QW_S3_*`, then `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`), and `--session-token` falls back to `AWS_SESSION_TOKEN`. Every run prints which source supplied the keys, with only the first four letters of the key ID. Never print a secret. When every flavor fails before a check runs, `setup_failure()` reports a connection problem, not an incompatibility. `src/run_store.py` owns write-once metadata, `src/report_model.py` evaluates required evidence, and `src/report_render.py` renders HTML/JSON/Markdown.
 
-Report structure: `QUESTIONS` in `src/report_model.py` holds the five questions plus a sixth `trust` section, word for word as the page. Every check carries a `group`, a `ratio` (headroom, at most 1.0 passes) and a `source` (command, evidence file, setting). Exactly nine checks have `required=True`; `tests/test_reporting.py::test_exactly_nine_checks_decide_the_result` pins them, and `test_nothing_untestable_holds_a_result_back` checks that a clean run can PASS. The 21 per-operation checks are information only, summarized by three deciding checks (`response_time`, `failed_requests`, `slowed_requests`) and shown in full in the operations table. `headline_limits` holds the notes that change how to read one run, such as a pause or a plain-HTTP endpoint.
+Report structure: `QUESTIONS` in `src/report_model.py` holds the five areas plus a sixth `trust` section, word for word as the page. Each area's name is phrased as a question; the data key stays `question`. Every check carries a `group`, a `ratio` (headroom, at most 1.0 passes) and a `source` (command, evidence file, setting). Exactly nine checks have `required=True`; `tests/test_reporting.py::test_exactly_nine_checks_decide_the_result` pins them, and `test_nothing_untestable_holds_a_result_back` checks that a clean run can PASS. The 21 per-operation checks are information only, summarized by three deciding checks (`response_time`, `failed_requests`, `slowed_requests`) and shown in full in the operations table. `headline_limits` holds the notes that change how to read one run, such as a pause or a plain-HTTP endpoint.
 
 Concurrency sweeps decide on serialization, not on latency spread. The metric is `FanoutLevelResult.speedup` = concurrency x median latency / batch wall clock, floor 2.0 from `*_serialization_min_speedup`. The older `efficiency` ratio (median latency / wall clock) is information only; it falls with concurrency for every backend and once failed AWS S3 itself at 0.09. Never decide on it. `tests/test_concurrency_fanout.py` holds the real AWS and StorageGRID numbers as a regression test.
 

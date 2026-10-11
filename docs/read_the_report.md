@@ -33,15 +33,15 @@ Read this box before you trust any number below it.
 
 A short list of the checks that did not pass, with failures first. Each item links to its row further down.
 
-## 4. The five questions
+## 4. The five areas tested
 
-Six boxes. Five are the questions from [What this tool measures](what_this_measures.md). The sixth says whether the run itself can be trusted.
+Six boxes. Five are the areas from [What this tool measures](what_this_measures.md). The sixth says whether the run itself can be trusted.
 
 Each box shows the worst result among its checks. If a box says PASS, every check under it passed.
 
 ## 5. All checks
 
-One table for each question. Each row is one check:
+One table for each area. Each row is one check:
 
 | Column | Meaning |
 |---|---|
@@ -164,4 +164,4 @@ The last section starts with **Tested at a later stage**: what this tool cannot 
 | INCONCLUSIVE response times | Too few samples to decide, or no AWS reference. The row says which. Run longer, or check the latency reference. |
 | FAIL in concurrency | Compare speedup with requests per second. If requests per second stopped growing early, test from a machine closer to the storage. |
 | FAIL in compatibility | Open `compat.md` in the run directory. It names the failing check under each set of settings. |
-| "Only 1 of the 4 stages ran" | The other questions read NOT RUN. Run the missing steps, or use `validate`. |
+| "Only 1 of the 4 stages ran" | The other areas read NOT RUN. Run the missing steps, or use `validate`. |

@@ -29,6 +29,37 @@ from src.run_store import RunSession, default_run_dir, public_config, write_json
 from src.workload_model import compute_op_mix, load_config
 
 
+def cmd_machine(args, run):
+    """Measure this machine and its distance to the storage. It never stops a run."""
+    from src.machine_check import measure, problems, summary_lines
+
+    config = run.config
+    op_mix = compute_op_mix(args.tier, config)
+    needed = max(load_file_descriptors(config), engine_file_descriptors(config, op_mix))
+    facts = measure(args.endpoint, run.path, needed)
+    run.record["machine"] = facts
+    run.save()
+    for line in summary_lines(facts, config, args.tier):
+        print("  " + line)
+    found = problems(facts, config, args.tier)
+    for _, message in found:
+        print("  Warning: " + message)
+    kinds = {kind for kind, _ in found}
+    if "size" in kinds:
+        print(
+            "  This machine may become the limit. Then response times and rates"
+            " describe the machine, not the storage."
+        )
+    if "distance" in kinds:
+        print(
+            "  Every request waits for the network at least once, so every"
+            " response time includes this round trip. AWS figures come from a"
+            " machine about 1 ms from AWS S3."
+        )
+    if found:
+        print("  These are warnings only. A run continues, and its report shows them at the top.")
+
+
 def cmd_compat(args, run):
     from src.compat_checks import probe_flavor, CHECKS
     from src.qw_s3_client import flavor_note
@@ -571,12 +602,23 @@ def run_stage(args, config, announce=True):
 
 # CLI name -> stage name stored in the manifest. The clear names are the ones
 # users type; the original names stay as aliases so existing scripts work.
-STAGE_ALIASES = {"read-concurrency": "fanout", "write-concurrency": "put-fanout"}
+STAGE_ALIASES = {
+    "check-machine": "machine",
+    "read-concurrency": "fanout",
+    "write-concurrency": "put-fanout",
+}
 # This is a validation, not a formal certification. `certify` was the
 # command's first name, and still works.
 COMMAND_ALIASES = {"certify": "validate"}
 
 STAGES = {
+    "check-machine": (
+        "Check this machine and its distance to the storage",
+        "Measures the cores, memory, free disk and open-file limit of this"
+        " machine, and the network round trip to the storage. It compares them"
+        " with what the tier needs. It warns, and never stops a run. validate"
+        " runs it first.",
+    ),
     "compat": (
         "Check S3 behavior and recommend a flavor",
         "Tries each storage flavor against the endpoint and reports the first one"
@@ -767,10 +809,15 @@ def cmd_validate(args, config, parser):
         )
     if args.run_dir is None:
         args.run_dir = str(default_run_dir())
-    steps = 5 + bool(args.with_aws_baseline) + (not args.keep_objects)
+    steps = 6 + bool(args.with_aws_baseline) + (not args.keep_objects)
     print(f"Run directory: {args.run_dir}")
 
-    print(f"\nStep 1 of {steps}: compatibility")
+    print(f"\nStep 1 of {steps}: test machine")
+    machine = stage_namespace(args, "machine", None, tier=args.tier)
+    machine.func = cmd_machine
+    run_stage(machine, config, announce=False)
+
+    print(f"\nStep 2 of {steps}: compatibility")
     compat = stage_namespace(args, "compat", "auto")
     compat.chosen_flavor = None if args.flavor == "auto" else args.flavor
     compat.func = cmd_compat
@@ -817,7 +864,7 @@ def cmd_validate(args, config, parser):
     how = "you chose" if args.flavor != "auto" else "the compatibility check picked"
     print(f"Using {flavor_label(flavor)} for the remaining steps, as {how}.")
 
-    print(f"\nStep 2 of {steps}: read concurrency")
+    print(f"\nStep 3 of {steps}: read concurrency")
     sweep = stage_namespace(
         args, "fanout", flavor, levels=args.levels, repeats=args.repeats,
         object_size_mb=8.0,
@@ -825,7 +872,7 @@ def cmd_validate(args, config, parser):
     sweep.func = cmd_sweep
     run_stage(sweep, config, announce=False)
 
-    print(f"\nStep 3 of {steps}: write concurrency")
+    print(f"\nStep 4 of {steps}: write concurrency")
     sweep = stage_namespace(
         args, "put-fanout", flavor, levels=args.levels, repeats=args.repeats,
         object_size_kb=512.0,
@@ -833,7 +880,7 @@ def cmd_validate(args, config, parser):
     sweep.func = cmd_sweep
     run_stage(sweep, config, announce=False)
 
-    print(f"\nStep 4 of {steps}: workload soak, {args.tier}")
+    print(f"\nStep 5 of {steps}: workload soak, {args.tier}")
     load = stage_namespace(
         args, "load", flavor, tier=args.tier, duration_min=args.duration_min,
         engine=args.engine,
@@ -850,7 +897,7 @@ def cmd_validate(args, config, parser):
 
     baseline = None
     if args.with_aws_baseline and failure is None:
-        print(f"\nStep 5 of {steps}: the same workload against AWS S3")
+        print(f"\nStep 6 of {steps}: the same workload against AWS S3")
         baseline = args.baseline_run_dir or str(default_run_dir())
         reference = argparse.Namespace(
             cmd="load",
@@ -1066,7 +1113,8 @@ def build_parser():
         stage = STAGE_ALIASES.get(name, name)
         p = sub.add_parser(
             name,
-            aliases=[stage] if stage != name else [],
+            # check-machine is new, so it has no older name to keep.
+            aliases=[stage] if stage != name and name != "check-machine" else [],
             help=summary,
             description=description,
         )
@@ -1088,6 +1136,14 @@ def build_parser():
                 help="This stage always probes every flavor.",
             )
             p.set_defaults(func=cmd_compat)
+        elif name == "check-machine":
+            p.add_argument(
+                "--tier",
+                required=True,
+                choices=["100GB", "1TB", "10TB", "100TB", "1PB", "10PB"],
+                help="Daily log ingestion volume the machine must send.",
+            )
+            p.set_defaults(func=cmd_machine)
         else:
             p.add_argument(
                 "--flavor",
@@ -1201,9 +1257,11 @@ def main(argv=None):
         if getattr(args, "with_aws_baseline", False):
             describe_credentials(args, argv, "aws_", "AWS baseline")
         config = load_config()
+        # The machine check writes nothing to the storage, so it costs nothing.
         if (
-            getattr(args, "tier", None) in config.get("extreme_tiers", {})
-            and not args.confirm_extreme_cost
+            args.cmd != "machine"
+            and getattr(args, "tier", None) in config.get("extreme_tiers", {})
+            and not getattr(args, "confirm_extreme_cost", False)
         ):
             parser.error(
                 "Extreme tiers require --confirm-extreme-cost because they can incur substantial storage and transfer costs."

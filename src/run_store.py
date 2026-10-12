@@ -54,6 +54,24 @@ def default_run_dir():
     return base / (stamp + "-" + uuid.uuid4().hex[:8])
 
 
+def physical_memory():
+    """The machine's memory in bytes, or None when the system does not say."""
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        pass
+    if platform.system() == "Darwin":
+        try:
+            return int(
+                subprocess.check_output(
+                    ["/usr/sbin/sysctl", "-n", "hw.memsize"], text=True
+                )
+            )
+        except (OSError, ValueError, subprocess.CalledProcessError):
+            pass
+    return None
+
+
 def provenance():
     def git(*args):
         try:
@@ -69,19 +87,7 @@ def provenance():
             versions[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             versions[name] = "unavailable"
-    try:
-        memory = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-    except (ValueError, OSError, AttributeError):
-        memory = None
-    if memory is None and platform.system() == "Darwin":
-        try:
-            memory = int(
-                subprocess.check_output(
-                    ["/usr/sbin/sysctl", "-n", "hw.memsize"], text=True
-                )
-            )
-        except (OSError, ValueError, subprocess.CalledProcessError):
-            pass
+    memory = physical_memory()
     # Include source fingerprints even for uncommitted or downloaded code.
     # The Rust load engine sends the workload, so its sources count too.
     engine = ROOT / "loadgen"
@@ -255,6 +261,7 @@ class RunSession:
                     typ.__name__
                 )  # Never serialize arbitrary exception credentials.
             filenames = {
+                "machine": [],
                 "compat": ["compat.json"],
                 "fanout": ["fanout.json"],
                 "put-fanout": ["put-fanout.json"],

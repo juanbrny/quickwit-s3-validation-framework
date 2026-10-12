@@ -99,6 +99,20 @@ pass_fail_bands:
   put_fanout_efficiency_min: 0.4   # the same diagnostic, for concurrent PUTs
   put_fanout_concurrency_levels: [1, 8, 16, 32, 64, 128]
 
+# The smallest test machine per tier: docs/run_a_validation.md, "Choose a test
+# machine". 1PB and 10PB need several machines, so they have no entry.
+test_machine:
+  # A same-region EC2 instance is about 1 ms from AWS S3. A small read may
+  # take 85 ms more than AWS before it fails, and a new HTTPS connection
+  # waits for the network two or three times. At 10 ms, the network alone
+  # can use a third of that margin.
+  max_round_trip_ms: 10
+  tiers:
+    100GB: {cores: 2, memory_gb: 4, disk_gb: 1}
+    1TB: {cores: 4, memory_gb: 8, disk_gb: 1}
+    10TB: {cores: 8, memory_gb: 16, disk_gb: 4}
+    100TB: {cores: 16, memory_gb: 32, disk_gb: 10}
+
 # Snapshotted with each run; changing this file cannot change old reports.
 reporting:
   minimum_p99_samples: 100

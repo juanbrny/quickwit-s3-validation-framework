@@ -24,6 +24,8 @@ A box under the result lists what the report cannot tell you. For example:
 
 - that the test machine stopped for a while, for example because it went to sleep — the report then leaves that time out, so the storage is not blamed for it;
 - that the test machine was near its limit, because searches started late or most cores were busy — the response times may then describe the machine, not the storage;
+- that the test machine was far from the storage — every response time then includes network time that the AWS figures do not, and the box says whether the distance can explain a failed response time;
+- that the test machine was smaller than recommended for the tier;
 - that only some of the steps ran;
 - that response times were compared with published AWS figures, not with your own AWS run;
 - that the certificate was not checked.
@@ -165,4 +167,5 @@ The last section starts with **Tested at a later stage**: what this tool cannot 
 | INCONCLUSIVE response times | Too few samples to decide, or no AWS reference. The row says which. Run longer, or check the latency reference. |
 | FAIL in concurrency | Compare speedup with requests per second. If requests per second stopped growing early, test from a machine closer to the storage. |
 | FAIL in compatibility | Open `compat.md` in the run directory. It names the failing check under each set of settings. |
+| "The test machine is N ms from the storage" | Run again from a machine in the same data center or region as the storage. If the box says the distance can explain the failure, the storage may still be fast enough. |
 | "Only 1 of the 4 stages ran" | The other areas read NOT RUN. Run the missing steps, or use `validate`. |

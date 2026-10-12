@@ -59,6 +59,26 @@ The load engine starts each search on a fixed schedule. It records how late each
 
 A run of a tier above `100GB` with the Python engine gets the same note, because one Python process cannot send those workloads at full speed. The note changes no result. It tells the reader that response times and the search rate may describe the test machine.
 
+## Checking the test machine before the run
+
+The first step of `validate`, and the `check-machine` command, record what the test machine can use. The report compares the record with `test_machine` in `config/tiers.yaml`, for the tier of the workload:
+
+| Measured | How | Rule |
+|---|---|---|
+| Cores | The processor affinity and the container's processor quota | At least the tier's `cores` |
+| Memory | The machine's memory, or the container's memory limit when lower | At least 90% of the tier's `memory_gb`, because the system keeps part of it |
+| Free disk | Free space in the run directory | At least the tier's `disk_gb` |
+| Open files | The highest open-file limit the process can set | At least what the workload can need at its busiest |
+| Network round trip | The fastest of 20 new TCP (Transmission Control Protocol) connections to the endpoint | At most `max_round_trip_ms`, 10 ms |
+
+A TCP connection opens in one network round trip, and the storage software takes no part in it. So the fastest connection is the network's share of every request. A same-region EC2 (Amazon Elastic Compute Cloud) instance is about 1 ms from AWS S3, and the AWS figures come from there. At 10 ms, the network alone can use a third of the margin of a small read: its limit is 85 ms above the AWS figure, and a new HTTPS connection waits two or three round trips. `1PB` and `10PB` have no entry, because no single machine can send them. Network bandwidth is not measured.
+
+The two checks are information only. A machine that misses a rule reads INCONCLUSIVE in "Can we trust this result?", and the report adds a note at the top. No other result changes.
+
+The report never subtracts the round trip from a response time. The network adds more than one fixed delay: new connections, lost packets, and slower large transfers. A number with the network removed would not be a measurement. The report compares instead. For each operation over its limit, it takes the amount by which the operation missed the limit. When the median round trip is longer, the note says that the distance can explain that failure.
+
+The `profile` command refuses a run whose round trip was over the limit. A reference profile describes AWS S3 from the same region.
+
 ## The workload
 
 Both load engines follow these rules. The numbers come from `config/tiers.yaml`.

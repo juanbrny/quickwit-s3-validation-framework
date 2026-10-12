@@ -8,6 +8,7 @@ from collections import Counter
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .machine_check import GIB, problems, requirement
 from .qw_s3_client import DEFAULT_FLAVORS, flavor_label, same_settings
 from .reference_profile import DEFAULT_PROFILE, describe, load_profile, reference_p99
 from .report import _load_jsonl, _percentile, summarize_ops
@@ -210,6 +211,145 @@ def machine_limit(load):
         " times and the search rate may then describe the test machine, not the"
         " storage. Use a machine from the recommendations in"
         " docs/run_a_validation.md, or a smaller tier.",
+    }
+
+
+def machine_facts(stages, tier):
+    """What the machine check measured, for the tier the workload ran.
+
+    The open files a run needs depend on the tier. A check recorded for
+    another tier says nothing about them, so they are left out.
+    """
+    record = stages.get("machine", {})
+    facts = record.get("machine")
+    if not facts:
+        return None
+    if tier and record.get("options", {}).get("tier") != tier:
+        facts = {**facts, "files_needed": None}
+    return facts
+
+
+def machine_checks(facts, cfg, tier):
+    """The two trust checks about the test machine. They never decide the result."""
+    found = problems(facts, cfg, tier) if facts else []
+    size = [message for kind, message in found if kind == "size"]
+    need = requirement(cfg, tier)
+    if not facts:
+        size_state, size_seen = NOT_RUN, "No machine check recorded"
+    else:
+        size_state = INCONCLUSIVE if size else PASS
+        size_seen = " ".join(size) if size else (
+            f"{facts['cores']} cores, "
+            + (f"{facts['memory_bytes'] / GIB:.1f} GB memory, " if facts.get("memory_bytes") else "")
+            + f"{facts['free_disk_bytes'] / GIB:.1f} GB free disk"
+            + (f", {facts['file_limit']:,} open files" if facts.get("file_limit") else "")
+        )
+    yield check(
+        "machine_size",
+        "Test machine size",
+        size_state,
+        size_seen,
+        f"At least {need['cores']} cores, {need['memory_gb']} GB memory and"
+        f" {need['disk_gb']} GB free disk for {tier}"
+        if need
+        else f"No single machine is recommended for {tier}",
+        "A machine smaller than recommended can become the limit. Then response"
+        " times and rates describe the machine, not the storage. Network"
+        " bandwidth is not checked.",
+        "Use a machine from \"Choose a test machine\" in docs/run_a_validation.md.",
+        group="trust",
+        required=False,
+    )
+    trip = (facts or {}).get("round_trip") or {}
+    most = (cfg.get("test_machine") or {}).get("max_round_trip_ms")
+    if trip.get("min_ms") is None:
+        state = NOT_RUN
+        seen = trip.get("error") or "No round trip recorded"
+    else:
+        state = INCONCLUSIVE if most and trip["min_ms"] > most else PASS
+        seen = (
+            f"{trip['min_ms']:.1f} ms at best, {trip['median_ms']:.1f} ms median,"
+            f" over {trip['attempts'] - trip.get('failures', 0)} connections"
+        )
+    yield check(
+        "network_distance",
+        "Network distance to the storage",
+        state,
+        seen,
+        f"Round trip of at most {most:g} ms" if most else "Information only",
+        "Every request waits for the network at least once, and a new HTTPS"
+        " connection waits two or three times. AWS figures come from a machine"
+        " about 1 ms from AWS S3. The fastest new TCP connection shows the"
+        " network's share, because the storage software takes no part in it.",
+        "Run from a machine in the same data center or region as the storage.",
+        group="trust",
+        required=False,
+        ratio=limit_ratio(trip.get("min_ms"), most) if most else None,
+    )
+
+
+def distance_note(facts, cfg, measurements):
+    """A headline note when the network, not the storage, may explain a failure.
+
+    The report never subtracts the round trip from a response time: the
+    network adds more than one fixed delay, and a corrected number is not a
+    measurement. It compares instead. When one round trip is longer than the
+    amount by which an operation missed its limit, the distance alone can
+    explain that failure.
+    """
+    trip = (facts or {}).get("round_trip") or {}
+    most = (cfg.get("test_machine") or {}).get("max_round_trip_ms")
+    if not most or trip.get("min_ms") is None or trip["min_ms"] <= most:
+        return None
+    rtt_s = trip["median_ms"] / 1000
+    over = [
+        (m["name"], m["p99_latency_s"] - m["limit_p99_s"])
+        for m in measurements
+        if m.get("latency_status") == FAIL and m.get("limit_p99_s")
+    ]
+    explained = [(name, excess) for name, excess in over if excess <= rtt_s]
+    detail = (
+        f"Opening a connection to the storage took {trip['min_ms']:.0f} ms at best."
+        " Every request waits for the network at least once, and a new HTTPS"
+        " connection waits two or three times. AWS figures come from a machine"
+        " about 1 ms from AWS S3. So response times in this report include"
+        " network time that the AWS figures do not."
+    )
+    listed = ", ".join(f"{name} ({excess * 1000:.0f} ms over)" for name, excess in explained)
+    if over and len(explained) == len(over):
+        detail += (
+            " The distance can explain every response-time failure: each"
+            " operation missed its limit by less than one round trip. " + listed + "."
+        )
+    elif explained:
+        detail += (
+            " The distance can explain some response-time failures, where the"
+            " operation missed its limit by less than one round trip: " + listed
+            + ". The other operations missed it by more."
+        )
+    elif over:
+        detail += (
+            " Every operation over its limit missed it by more than one round"
+            " trip, so the distance alone does not explain the failures."
+        )
+    detail += " Run again from a machine in the same data center or region as the storage."
+    return {
+        "title": f"The test machine is {trip['min_ms']:.0f} ms from the storage",
+        "detail": detail,
+    }
+
+
+def size_note(facts, cfg, tier):
+    """A headline note when the test machine is smaller than recommended."""
+    size = [message for kind, message in problems(facts, cfg, tier) if kind == "size"] if facts else []
+    if not size:
+        return None
+    return {
+        "title": "The test machine is smaller than recommended",
+        "detail": "The machine check found: " + " ".join(size) + " The machine may"
+        " then be the limit, so response times and rates may describe it, not"
+        " the storage. Use a machine from the recommendations in"
+        " docs/run_a_validation.md.",
     }
 
 
@@ -659,6 +799,9 @@ def build_report(
         group="trust",
         required=False,
     )
+    tier = options.get("tier") or stages.get("machine", {}).get("options", {}).get("tier")
+    facts = machine_facts(stages, tier)
+    checks.extend(machine_checks(facts, cfg, tier))
 
     compat = read_json(path / "compat.json") if (path / "compat.json").exists() else {}
     rec = compat.get("recommended_flavor")
@@ -1358,6 +1501,9 @@ def build_report(
     limit = machine_limit(load)
     if limit:
         headline_limits.insert(0, limit)
+    for note in (size_note(facts, cfg, tier), distance_note(facts, cfg, measurements)):
+        if note:
+            headline_limits.insert(0, note)
     # A short run leaves checks unanswered for reasons that are arithmetic, not
     # faults. Say so first, in numbers, so nobody hunts for a problem.
     if load.get("status") == "COMPLETED":
@@ -1514,6 +1660,7 @@ def build_report(
     # incomplete, then how far its results carry.
     order = (
         "The test machine stopped",
+        "The test machine is ",
         "Only ",
         "This run was too short",
         "This run used plain HTTP",

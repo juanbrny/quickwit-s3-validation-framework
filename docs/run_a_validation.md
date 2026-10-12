@@ -63,6 +63,32 @@ The engine itself is light. Against a local server that stores nothing, it sent 
 
 The report checks the machine on every run. If searches started late, or the engine kept most cores busy, the report says so at the top. Then the results may describe the test machine, not the storage.
 
+### Check the test machine
+
+The machine must also be close to the storage. Every request waits for the network at least once, and a new HTTPS connection waits two or three times. The AWS figures come from a machine about 1 ms from AWS S3. Use a machine in the same data center or region as the storage: the network round trip must be 10 ms or less.
+
+`validate` checks the machine first, in a few seconds. To check a machine before you start a run, use the same connection settings and the tier you plan to run:
+
+```bash
+byoc-s3 check-machine --tier 1TB --run-dir reports/machine-check
+```
+
+It prints what it found, and what the tier needs:
+
+```text
+Cores: 32 (the 1TB tier needs 4)
+Memory: 124.4 GB (the 1TB tier needs 8 GB)
+Free disk: 61.2 GB (the 1TB tier needs 1 GB)
+Open files: 65,536 (the run needs about 1,496)
+Network round trip to s3.us-east-1.amazonaws.com: 0.6 ms at best, 0.9 ms median (limit 10 ms)
+```
+
+- **Cores and memory** are the ones the container may use, not only the host's. On macOS, these are the values of the Docker Desktop or Rancher Desktop virtual machine.
+- **The network round trip** is the time to open a new TCP (Transmission Control Protocol) connection to the storage. The storage software takes no part in it, so it shows the network's share of every request. The check opens 20 connections and keeps the fastest.
+- **Network bandwidth** is not checked. Check it against the table above.
+
+The check only warns. A run continues on any machine, and the report shows each warning at the top. A machine over 10 ms away also gets a note that says whether the distance can explain a failed response time.
+
 ### Permissions
 
 The keys need these S3 permissions. Object permissions can be limited to the `qwcert/` folder, where every test object lives. On AWS, this is the IAM policy:
@@ -158,16 +184,17 @@ If the machine does stop, the report says so at the top, and leaves that time ou
 byoc-s3 validate --tier 1TB --duration-min 30
 ```
 
-`validate` runs five steps, in this order:
+`validate` runs seven steps, in this order:
 
-1. **Compatibility.** Tries each known set of settings, and picks the first one that passes every check.
-2. **Read concurrency.** Sends growing groups of reads at the same time.
-3. **Write concurrency.** The same, for uploads.
-4. **Workload.** Sends the real storage traffic of Datadog BYOC Logs (BYOC), at the daily volume you chose, for the minutes you chose.
-5. **Report.** Writes `report.html`, `report.json` and `report.md`.
-6. **Cleanup.** Deletes every object this run wrote to the bucket.
+1. **Test machine.** Measures this machine and its network round trip to the storage, and warns when either may limit the run. See [Check the test machine](#check-the-test-machine).
+2. **Compatibility.** Tries each known set of settings, and picks the first one that passes every check.
+3. **Read concurrency.** Sends growing groups of reads at the same time.
+4. **Write concurrency.** The same, for uploads.
+5. **Workload.** Sends the real storage traffic of Datadog BYOC Logs (BYOC), at the daily volume you chose, for the minutes you chose.
+6. **Report.** Writes `report.html`, `report.json` and `report.md`.
+7. **Cleanup.** Deletes every object this run wrote to the bucket.
 
-Each step uses the settings that step 1 picked. You do not copy anything by hand.
+Each step uses the settings that step 2 picked. You do not copy anything by hand.
 
 ### What cleanup deletes
 
@@ -179,7 +206,7 @@ To keep the objects, for example to inspect them, add `--keep-objects`.
 
 ### Which settings are used
 
-Step 1 tries known sets of settings, from the mildest to the strongest. It stops at the first set that passes every check. If BYOC's own defaults pass, it picks those, and the report says **BYOC defaults (no flavor setting)**. That is the best result: BYOC needs no special settings.
+Step 2 tries known sets of settings, from the mildest to the strongest. It stops at the first set that passes every check. If BYOC's own defaults pass, it picks those, and the report says **BYOC defaults (no flavor setting)**. That is the best result: BYOC needs no special settings.
 
 To test the settings you will actually deploy, choose them:
 
@@ -209,7 +236,7 @@ Over plain `http://`, uploads send their checksum in a different way than over `
 | Option | Use it to |
 |---|---|
 | `--run-dir PATH` | Choose where the results go. By default, a new timestamped directory. |
-| `--flavor NAME` | Test these settings instead of the ones step 1 picks. |
+| `--flavor NAME` | Test these settings instead of the ones step 2 picks. |
 | `--keep-objects` | Leave the test objects in the bucket. |
 | `--levels 1,8,16,32` | Test fewer concurrency levels. |
 | `--ca-bundle PATH` | Trust a private certificate authority. On-premises storage usually needs this. |
@@ -300,6 +327,7 @@ Only transfers of at least 16 MiB count toward a speed. On a smaller transfer, t
 Use this when you need to repeat one step, or run steps from different machines. Give every step the same `--run-dir`.
 
 ```bash
+byoc-s3 check-machine --run-dir reports/my-test --tier 1TB
 byoc-s3 compat --run-dir reports/my-test
 ```
 
@@ -335,7 +363,7 @@ byoc-s3 cleanup --run-dir reports/run-a --run-dir reports/run-b --old-compat-obj
 ## What lands in the run directory
 
 ```text
-manifest.json          what ran, when, with which settings
+manifest.json          what ran, when, with which settings, and the machine check
 compat.json, .md       the settings tried, and the ones picked
 fanout.json            read concurrency measurements
 put-fanout.json        write concurrency measurements
@@ -362,6 +390,8 @@ Keep `report-evidence/` next to `report.html`, or the download links break.
 | `No flavor passed every compatibility check` | The tool connected, but no known settings work. Open `compat.md` in the run directory to see which check failed. |
 | `The 1TB tier needs the Rust load engine` | Only when you run from source. Build the engine. See [Run from source](#run-from-source). |
 | `Name or service not known`, or no connection to `localhost` | On macOS, use `host.docker.internal` instead of `localhost`. If the storage system has no host name for each bucket, the compatibility step picks settings with path-style addresses. |
+| `The test machine is N ms from the storage` (in the report) | The machine is far from the storage, so response times include network time. Run from a machine in the same data center or region. See [Check the test machine](#check-the-test-machine). |
+| `The test machine is smaller than recommended` (in the report) | Use a bigger machine, or a smaller tier. See [Choose a test machine](#choose-a-test-machine). |
 | `The test machine was near its limit` (in the report) | The machine could not keep to the workload's schedule. Use a bigger machine. See [Choose a test machine](#choose-a-test-machine). |
 | `Too many open files`, or `This machine ran out of open files` | A limit of your machine, not of the storage. The tool raises it by itself where it can. If it cannot, run the `ulimit -n` command the message shows, and start again. The `100TB` tier needs about 16,500 open files. |
 | `The ... worker stopped: ...` | The workload stopped early. The message names the real cause. The measurements up to that point are kept, and `validate` still writes the report. |

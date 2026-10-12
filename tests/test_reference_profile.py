@@ -129,7 +129,8 @@ MIB = 1024 * 1024
 
 def _aws_run(tmp_path, download_mib_s=90.0, upload_mib_s=70.0, small_p50=0.020,
              endpoint="https://s3.us-east-1.amazonaws.com", pauses=None,
-             idle_p50=0.025, searches=2000, deletes=300, delete_s=0.25):
+             idle_p50=0.025, searches=2000, deletes=300, delete_s=0.25,
+             round_trip_ms=None):
     """A finished AWS run with known speeds, so the derived numbers are checkable."""
     from examples.make_sample_report import make_bundle
     from src.run_store import digest, read_json, write_json
@@ -165,6 +166,10 @@ def _aws_run(tmp_path, download_mib_s=90.0, upload_mib_s=70.0, small_p50=0.020,
     load["options"]["runner_location"] = "ec2 c5n.2xlarge us-east-1a"
     if pauses:
         load["pauses"] = pauses
+    if round_trip_ms:
+        manifest["stages"]["machine"]["machine"]["round_trip"].update(
+            min_ms=round_trip_ms, median_ms=round_trip_ms
+        )
     # The idle read test: the same small reads with nothing else running.
     fanout = read_json(run / "fanout.json")
     for level in fanout["levels"]:
@@ -202,6 +207,7 @@ def test_a_written_profile_loads_and_grades_uploads_with_their_own_speed(tmp_pat
 @pytest.mark.parametrize("change,message", [
     (dict(endpoint="http://192.168.0.10:10444"), "not AWS S3"),
     (dict(pauses=[{"started_epoch": 1.0, "seconds": 90}]), "paused"),
+    (dict(round_trip_ms=40.0), "40.0 ms from AWS S3"),
 ])
 def test_runs_that_cannot_give_honest_numbers_are_refused(tmp_path, change, message):
     values, errors, _ = derive_profile(_aws_run(tmp_path, **change))

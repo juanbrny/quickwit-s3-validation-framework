@@ -89,6 +89,8 @@ Before anything else, the report checks its own evidence:
 
 If one of these fails, the affected result says INCONCLUSIVE. It does not pass.
 
+The report also shows whether the test machine was fit for the run: big enough for the daily volume, and close enough to the storage. A machine far from the storage adds network time to every response time. These two checks are information only. When the machine misses one, the report says so at the top, but no result changes.
+
 ## Tested at a later stage
 
 This tool cannot test everything, because some things need the real BYOC modules. They are tested later, in the BYOC performance tests. They never stop a run from passing here.

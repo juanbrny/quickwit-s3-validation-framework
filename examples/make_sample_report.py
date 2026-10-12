@@ -54,6 +54,25 @@ def make_bundle(path, aws=False):
     stages = {
         name: copy.deepcopy(base) for name in ("compat", "fanout", "put-fanout", "load")
     }
+    stages["machine"] = copy.deepcopy(base)
+    stages["machine"]["options"] = {"tier": "1TB", "runner_location": base["options"]["runner_location"]}
+    stages["machine"]["machine"] = {
+        "cores": 8,
+        "memory_bytes": 32 * 1024**3,
+        "free_disk_bytes": 200 * 1024**3,
+        "file_limit": 65536,
+        "files_needed": 1100,
+        "round_trip": {
+            "host": identity["endpoint"].split("//")[1],
+            "port": 443,
+            "attempts": 20,
+            "failures": 0,
+            "address": "192.0.2.10",
+            "min_ms": 0.42,
+            "median_ms": 0.61,
+            "max_ms": 1.8,
+        },
+    }
     load = stages["load"]
     load["options"].update(tier="1TB", duration_min=3.0)
     load.update(

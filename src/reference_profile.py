@@ -203,6 +203,15 @@ def derive_profile(run_dir):
         errors.append("The run did not use AWS S3's default settings (flavor aws).")
     if load.get("pauses"):
         errors.append("The test machine paused during the run.")
+    # The profile describes AWS S3 from the same region. A distant machine
+    # would write its own network time into every limit.
+    trip = manifest["stages"].get("machine", {}).get("machine", {}).get("round_trip", {})
+    most = manifest["config"].get("test_machine", {}).get("max_round_trip_ms")
+    if most and trip.get("min_ms") is not None and trip["min_ms"] > most:
+        errors.append(
+            f"The test machine was {trip['min_ms']:.1f} ms from AWS S3, and the limit"
+            f" is {most:g} ms. Use an EC2 instance in the bucket's region."
+        )
 
     rows = []
     for name in ("ingest_merge.jsonl", "query.jsonl"):

@@ -547,7 +547,7 @@ def test_validate_runs_every_stage_with_the_recommended_flavor(
         == 0
     )
     manifest = read_json(run / "manifest.json")
-    assert set(manifest["stages"]) == {"compat", "fanout", "put-fanout", "load"}
+    assert set(manifest["stages"]) == {"machine", "compat", "fanout", "put-fanout", "load"}
     recommended = read_json(run / "compat.json")["recommended_flavor"]
     for stage in ("fanout", "put-fanout", "load"):
         assert manifest["stages"][stage]["options"]["flavor"] == recommended
@@ -614,7 +614,7 @@ def test_validate_stops_when_no_flavor_works(moto_server_endpoint, tmp_path, mon
         main(["validate", "--endpoint", moto_server_endpoint, "--bucket", "qw-nogo",
               "--access-key", "testing", "--secret-key", "testing",
               "--run-dir", str(run), "--tier", "100GB", "--duration-min", "0.01"])
-    assert set(read_json(run / "manifest.json")["stages"]) == {"compat"}
+    assert set(read_json(run / "manifest.json")["stages"]) == {"machine", "compat"}
 
 
 def test_validate_runs_the_baseline_leg_with_matching_metadata(

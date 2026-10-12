@@ -4,7 +4,7 @@
 # packages, the tool and the engine binary. Nobody who runs the image needs
 # Python, a virtual environment or Rust on their own machine.
 #
-# Build for one platform:  docker build -t byoc-s3-validation .
+# Build for one platform:  docker build -t ghcr.io/juanbrny/byoc-s3-validation .
 # Build for both, and push: see docs/run_a_validation.md, "Build the image".
 
 # The engine compiles on the build machine's own architecture, for the
@@ -53,7 +53,7 @@ COPY --from=engine /byoc-loadgen /usr/local/bin/byoc-loadgen
 RUN chmod -R a+rX /app && chmod a+rx /app/bin/*
 
 # The image name `print-wrapper` writes into the wrapper script.
-ARG IMAGE=byoc-s3-validation:latest
+ARG IMAGE=ghcr.io/juanbrny/byoc-s3-validation:latest
 # git is not in the image, so the build records the commit instead.
 ARG SOURCE_COMMIT=unknown
 ENV BYOC_IMAGE=$IMAGE \
@@ -64,6 +64,7 @@ ENV BYOC_IMAGE=$IMAGE \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 LABEL org.opencontainers.image.title="Datadog BYOC Logs S3 storage validation" \
+      org.opencontainers.image.source="https://github.com/juanbrny/quickwit-s3-validation-framework" \
       org.opencontainers.image.revision=$SOURCE_COMMIT
 ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/app/bin/entrypoint.sh"]
 CMD ["--help"]

@@ -8,12 +8,11 @@ This is a storage-only test. It does not test search results, data durability or
 
 ## Quick start
 
-The tool runs in a container. You need Docker or Podman, and no Python or Rust. Build the image, and install `byoc-s3`, the script that runs it:
+The tool runs in a container. You need Docker or Podman, and no Python or Rust. Install `byoc-s3`, the script that runs the published image:
 
 ```bash
-docker build -t byoc-s3-validation .
 mkdir -p ~/.local/bin
-docker run --rm byoc-s3-validation print-wrapper > ~/.local/bin/byoc-s3
+docker run --rm ghcr.io/juanbrny/byoc-s3-validation print-wrapper > ~/.local/bin/byoc-s3
 chmod +x ~/.local/bin/byoc-s3
 ```
 

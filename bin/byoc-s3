@@ -18,7 +18,7 @@
 # Settings: BYOC_S3_IMAGE (image to run), BYOC_S3_RUNTIME (docker or podman).
 set -euo pipefail
 
-DEFAULT_IMAGE="byoc-s3-validation:latest"
+DEFAULT_IMAGE="ghcr.io/juanbrny/byoc-s3-validation:latest"
 IMAGE="${BYOC_S3_IMAGE:-$DEFAULT_IMAGE}"
 
 runtime="${BYOC_S3_RUNTIME:-}"

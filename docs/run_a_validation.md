@@ -13,16 +13,15 @@ You do not need an Amazon Web Services (AWS) account. The tool compares your sto
 
 ## Install
 
-You need two things: the container image, and `byoc-s3`, a small script that runs it. Build the image from this repository, then write the script into a folder on your `PATH`:
+You need two things: the container image, and `byoc-s3`, a small script that runs it. The image is published as `ghcr.io/juanbrny/byoc-s3-validation`, for `linux/amd64` and `linux/arm64`. Docker picks the right one for your machine. These commands download the image, then write the script into a folder on your `PATH`:
 
 ```bash
-docker build -t byoc-s3-validation .
 mkdir -p ~/.local/bin
-docker run --rm byoc-s3-validation print-wrapper > ~/.local/bin/byoc-s3
+docker run --rm ghcr.io/juanbrny/byoc-s3-validation print-wrapper > ~/.local/bin/byoc-s3
 chmod +x ~/.local/bin/byoc-s3
 ```
 
-If you received a published image name, pull that image instead of building it, and use its name in the second command. The script then runs that image. To run another image later, set `BYOC_S3_IMAGE`. To use Podman when both are installed, set `BYOC_S3_RUNTIME=podman`.
+To update the tool, run `docker pull ghcr.io/juanbrny/byoc-s3-validation`. To run another image, for example one you built yourself, set `BYOC_S3_IMAGE`. To use Podman when both are installed, set `BYOC_S3_RUNTIME=podman`.
 
 Every command on this page starts with `byoc-s3`. The script passes its arguments to the tool unchanged. It also sets up the container:
 
@@ -399,16 +398,19 @@ The load engine in `loadgen/` sends the workload. One Python process cannot: it 
 
 ## Build the image
 
-The image holds Python, its packages, the tool and the load engine. To build it for this machine only:
+The image holds Python, its packages, the tool and the load engine. To build it for this machine only, under the published name, so that `byoc-s3` runs your build:
 
 ```bash
-docker build -t byoc-s3-validation .
+docker build -t ghcr.io/juanbrny/byoc-s3-validation .
 ```
 
-To publish one image for both `linux/amd64` and `linux/arm64`, build with `buildx` and push it to a registry. Pass the same name as `IMAGE`, so that `print-wrapper` writes a script that runs this image. `SOURCE_COMMIT` goes into every run record, because the image has no git:
+To publish a new version for both `linux/amd64` and `linux/arm64`, log in to the GitHub container registry with a token that has the `write:packages` scope, then build with `buildx` and push. `SOURCE_COMMIT` goes into every run record, because the image has no git. Each version gets two tags: `latest`, which `byoc-s3` runs, and its commit, which never changes:
 
 ```bash
-docker buildx build --platform linux/amd64,linux/arm64 --build-arg IMAGE=registry.example.com/byoc-s3-validation:1.0 --build-arg SOURCE_COMMIT=$(git rev-parse HEAD) -t registry.example.com/byoc-s3-validation:1.0 --push .
+docker login ghcr.io -u <github-user>
+docker buildx build --platform linux/amd64,linux/arm64 --build-arg SOURCE_COMMIT=$(git rev-parse HEAD) -t ghcr.io/juanbrny/byoc-s3-validation:latest -t ghcr.io/juanbrny/byoc-s3-validation:$(git rev-parse --short HEAD) --push .
 ```
+
+Publish only from a commit that is pushed, so the commit in each run record can be found.
 
 The load engine compiles on the build machine's own architecture for each target, so the build takes a few minutes for each platform.

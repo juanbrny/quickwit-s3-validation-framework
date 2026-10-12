@@ -66,10 +66,14 @@ def probe_delete_visibility(client: QwS3Client, bucket: str, prefix: str) -> dic
     client.put_split(bucket, key, b"x" * 1024)
     del_res = client.delete_batch(bucket, [key])
     get_res = client.get_full(bucket, key)
+    # The delete's own time. The profile command measures AWS delete latency
+    # from these: a run has a delete check every few seconds, but only a few
+    # merge deletes.
     is_gone = (not get_res["ok"]) and get_res.get("error") in ("NoSuchKey", "404", "NotFound")
     return {
         "probe": "delete_visibility", "key": key,
         "delete_ok": del_res.get("ok", False), "is_gone": bool(is_gone),
+        "delete_latency_s": del_res.get("latency_s"),
         "success": bool(del_res.get("ok") and is_gone),
     }
 

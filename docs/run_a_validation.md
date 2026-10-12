@@ -277,13 +277,13 @@ It refuses a run that cannot give honest figures:
 - the endpoint is not AWS S3;
 - a step did not finish;
 - the machine paused;
-- there are too few samples;
+- there are too few samples, including fewer than 100 timed deletes. Runs recorded before the visibility checks timed their deletes have too few;
 - small reads were more than twice as slow during the workload as in the idle read test, so the test machine was overloaded;
 - the run sent less than 90% of the searches per second its tier asks for.
 
 It warns when small reads look too slow to come from inside the region.
 
-It measures four values:
+It measures five values:
 
 | Value | Measured as |
 |---|---|
@@ -291,6 +291,7 @@ It measures four values:
 | `fanout_tail_factor` | The p99 of whole searches, divided by the small-read p99. |
 | `per_stream_mb_s` | The median speed of whole-file downloads, one stream each. |
 | `upload_per_stream_mb_s` | The median speed of uploads, one stream each. |
+| `delete_p99_s` | The p99 of the delete requests. Most come from the visibility checks, which delete one key every few seconds. The others are the merges' bulk deletes. |
 
 Only transfers of at least 16 MiB count toward a speed. On a smaller transfer, the time after the first byte is too short to measure a speed from.
 

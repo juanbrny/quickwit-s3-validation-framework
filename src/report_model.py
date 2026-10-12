@@ -861,7 +861,9 @@ def build_report(
             # vendor side.
             enough_reference = measured_reference.get("count", 0) >= minimum
         else:
-            bp99 = reference_p99(profile, op, median_bytes)
+            bp99 = reference_p99(
+                profile, op, median_bytes, cfg.get("model_constants", {}).get("merge_factor", 10)
+            )
             # The profile is a published figure, so there is no second sample
             # set to qualify. Only the vendor's samples apply.
             enough_reference = True

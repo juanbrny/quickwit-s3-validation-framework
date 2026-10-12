@@ -9,7 +9,7 @@
 # docs/measurement_policy.md.
 
 id: aws-s3-ec2-same-region
-version: 1
+version: 2
 status: provisional
 title: AWS S3 Standard, read from an EC2 instance in the same region
 
@@ -40,6 +40,14 @@ latency:
   # returns. The p99 of that maximum is worse than the p99 of one read. This
   # factor covers the difference. It is an assumption, not a measurement.
   fanout_tail_factor: 2.0
+
+  # The p99 of one delete request. A delete moves no bytes, but S3 updates
+  # its index for every key, so it is slower than a small read. Version 1
+  # graded deletes as small reads, and AWS S3 itself failed: from an
+  # m5a.8xlarge in us-east-1, bulk deletes of 10 keys took about 300 ms,
+  # against a limit of 255 ms. This value is the slowest of those 4 deletes,
+  # until a measured profile replaces it.
+  delete_p99_s: 0.30
 
 throughput:
   # One request, one stream. AWS tells applications to open one concurrent

@@ -147,12 +147,13 @@ Latency checks compare against AWS S3. There are two ways to supply that compari
 
 **Bundled reference profile (the default).** Most vendors have no AWS account. The framework therefore ships the bar it grades against, in `config/reference_profiles/`. Select one with `--reference <id>`, give a path to your own file, or pass `--reference none` to leave latency checks inconclusive.
 
-A profile holds a few numbers, not a table of per-operation latencies. The two that matter most:
+A profile holds a few numbers, not a table of per-operation latencies. These three matter most:
 
 | Field | Meaning |
 |---|---|
 | `latency.first_byte_p99_s` | The 99th percentile of one small request, measured in region. This is a tail figure, because the framework compares p99 to p99. |
 | `throughput.per_stream_mb_s` | The rate one request transfers bytes at. AWS advises one concurrent request for each 85-90 MB/s wanted. |
+| `latency.delete_p99_s` | The 99th percentile of one delete request, measured in region. |
 
 The limit for one operation then follows its own recorded payload size:
 
@@ -163,9 +164,11 @@ reference  = first_byte_p99_s + bytes / throughput
 limit      = reference x the operation's multiplier
 ```
 
-Two numbers therefore cover every operation and every tier, including tiers nobody has measured. A small read costs one round trip. An 8 GB mature split read costs about 91 seconds, where the round trip is a tenth of a percent.
+Two numbers therefore cover every read and upload at every tier, including tiers nobody has measured. A small read costs one round trip. An 8 GB mature split read costs about 91 seconds, where the round trip is a tenth of a percent.
 
 Queries are the exception. A query finishes when the slowest of its concurrent reads returns, and the 99th percentile of that maximum sits above the 99th percentile of one read. `latency.fanout_tail_factor` covers the difference. In a provisional profile it is an assumption. In a profile written by `run_validation.py profile` it is measured: the p99 of whole searches, divided by the p99 of small reads.
+
+Deletes are the other exception. A delete moves no bytes, but S3 updates its index for every key, so it is slower than a small read. A bulk delete uses `latency.delete_p99_s` as its reference. A flavor without bulk delete sends one request per key, so its reference is `delete_p99_s` times the number of keys in one merge, `merge_factor`. Version 1 of the bundled profile graded deletes as small reads, and AWS S3 itself failed: its bulk deletes of 10 keys took about 300 ms, against a limit of 255 ms. A profile without `delete_p99_s` still grades deletes as small reads.
 
 Uploads can be slower than downloads. A measured profile records `throughput.upload_per_stream_mb_s` for uploads. An older profile without it uses `per_stream_mb_s` for both. How to record a new profile is in [Run a validation](run_a_validation.md#refresh-the-aws-reference-profile).
 

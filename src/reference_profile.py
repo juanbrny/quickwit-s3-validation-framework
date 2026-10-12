@@ -5,16 +5,21 @@ record their own AWS Simple Storage Service (S3) run blocks the whole
 certification. This module supplies the reference latency instead, from a
 published profile in `config/reference_profiles/`.
 
-The profile holds two numbers, not a table of per-operation latencies:
+The profile holds three numbers, not a table of per-operation latencies:
 
 * `first_byte_p99_s`, the tail latency of one small request.
 * `per_stream_mb_s`, the rate one request transfers bytes at.
+* `delete_p99_s`, the tail latency of one delete request.
 
 A per-operation table would need re-measuring whenever a tier's object size
-changes. These two numbers plus the recorded object size cover every operation
-and every tier:
+changes. The first two numbers plus the recorded object size cover every read
+and upload, at every tier:
 
     reference p99 = first_byte_p99 + bytes / effective throughput
+
+A delete moves no bytes, but it is not a small read either: S3 updates its
+index for every key. Graded as a small read, AWS S3 itself failed: its bulk
+deletes of 10 keys took about 300 ms, against a limit of 255 ms.
 
 A measured baseline always wins when the operator supplies one. See
 `docs/measurement_policy.md`.
@@ -37,6 +42,9 @@ NO_PROFILE = "none"
 FANOUT_OPS = ("query_wall_clock",)
 # Operations that upload, and therefore follow Quickwit's multipart policy.
 UPLOAD_OPS = ("put_object", "multipart_upload")
+# One request that deletes many keys, and one request per key.
+BULK_DELETE_OPS = ("delete_objects_bulk",)
+LOOP_DELETE_OPS = ("delete_object_loop",)
 
 
 def available_profiles():
@@ -57,27 +65,37 @@ def load_profile(name=DEFAULT_PROFILE):
             + f", or {NO_PROFILE}."
         )
     profile = yaml.safe_load(path.read_text(encoding="utf-8"))
-    for section, field in (
-        ("latency", "first_byte_p99_s"),
-        ("latency", "fanout_tail_factor"),
-        ("throughput", "per_stream_mb_s"),
+    for section, field, required in (
+        ("latency", "first_byte_p99_s", True),
+        ("latency", "fanout_tail_factor", True),
+        ("latency", "delete_p99_s", False),
+        ("throughput", "per_stream_mb_s", True),
     ):
         value = profile.get(section, {}).get(field)
+        if value is None and not required:
+            continue
         if not isinstance(value, (int, float)) or value <= 0:
             raise ValueError(f"Reference profile {name}: {section}.{field} must be positive.")
     return profile
 
 
-def reference_p99(profile, op, median_bytes):
+def reference_p99(profile, op, median_bytes, keys_per_delete=10):
     """The p99 this profile predicts for one operation, in seconds.
 
     `median_bytes` is the recorded median payload of that operation in this
     run, so the prediction follows the tier's real object sizes instead of an
-    assumed one.
+    assumed one. `keys_per_delete` is how many keys one garbage collection
+    step deletes: a flavor without bulk delete sends one request per key.
     """
     if not profile:
         return None
     latency = profile["latency"]["first_byte_p99_s"]
+    # A profile from before delete_p99_s grades deletes as small requests.
+    delete = profile["latency"].get("delete_p99_s", latency)
+    if op in BULK_DELETE_OPS:
+        return delete
+    if op in LOOP_DELETE_OPS:
+        return delete * max(1, keys_per_delete)
     if op in FANOUT_OPS:
         # A query completes when its slowest concurrent read returns. The p99
         # of that maximum sits above the p99 of a single read.
@@ -132,13 +150,16 @@ def describe(profile):
 #   fanout_tail_factor     search p99 / small-read p99
 #   per_stream_mb_s        median speed of whole-file downloads, one stream each
 #   upload_per_stream_mb_s median speed of single-stream uploads
+#   delete_p99_s           p99 of the delete requests: the visibility checks'
+#                          single-key deletes, and the merges' bulk deletes
 #
 # Speeds use the time after the first byte: each transfer's latency minus the
 # median small-read latency, which is the typical time to the first byte.
 
 SMALL_READS = ("get_term_or_field", "get_doc")
 DOWNLOADS = ("get_object_full",)
-MIN_SAMPLES = {"small reads": 100, "searches": 100, "downloads": 10, "uploads": 10}
+MIN_SAMPLES = {"small reads": 100, "searches": 100, "downloads": 10, "uploads": 10,
+               "deletes": 100}
 IN_REGION_MEDIAN_S = 0.050  # a small read from inside the region is far faster
 # A single test process can only send so many requests before its own work
 # slows every request down. Small reads during the workload may then take far
@@ -204,17 +225,32 @@ def derive_profile(run_dir):
             and r["latency_s"] - small_p50 >= TRANSFER_DOMINATES * small_p50
         )
 
+    # A 30-minute run has only a few merge deletes, so most delete samples
+    # come from the visibility checks, which delete one key every few seconds.
+    deletes = [r["latency_s"] for r in ok if r["op"] in BULK_DELETE_OPS]
+    probes = run_dir / "consistency.jsonl"
+    if probes.exists():
+        for line in probes.read_text().splitlines():
+            probe = json.loads(line) if line.strip() else {}
+            if probe.get("delete_ok") and isinstance(probe.get("delete_latency_s"), (int, float)):
+                deletes.append(probe["delete_latency_s"])
     downloads = [r for r in ok if r["op"] in DOWNLOADS and large(r)]
     uploads = [
         r for r in ok
         if r["op"] in UPLOAD_OPS and large(r) and r["bytes"] <= part  # one stream
     ]
     counts = {"small reads": len(small), "searches": len(searches),
-              "downloads": len(downloads), "uploads": len(uploads)}
+              "downloads": len(downloads), "uploads": len(uploads), "deletes": len(deletes)}
     for name, need in MIN_SAMPLES.items():
         if counts[name] < need:
             kind = f"large {name} (at least {LARGE_TRANSFER_MIB} MiB)" if name in ("downloads", "uploads") else name
-            errors.append(f"Only {counts[name]} {kind}; at least {need} are needed.")
+            message = f"Only {counts[name]} {kind}; at least {need} are needed."
+            if name == "deletes":
+                message += (
+                    " Runs recorded before the visibility checks timed their deletes"
+                    " have only the merge deletes. Record a new run."
+                )
+            errors.append(message)
     if errors:
         return None, errors, warnings
 
@@ -266,6 +302,7 @@ def derive_profile(run_dir):
         "fanout_tail_factor": round(_percentile(searches, 99) / first_byte_p99, 2),
         "per_stream_mb_s": round(speed(downloads), 1),
         "upload_per_stream_mb_s": round(speed(uploads), 1),
+        "delete_p99_s": round(_percentile(deletes, 99), 4),
         "counts": counts,
         "small_read_p50_s": round(first_byte_p50, 4),
         "run_id": manifest["run_id"],
@@ -307,6 +344,7 @@ context:
     searches: {searches}
     downloads: {downloads}
     uploads: {uploads}
+    deletes: {deletes}
   references:
     - "AWS S3 best practices whitepaper. Make one concurrent request for each 85-90 MB/s of desired network throughput."
     - "dvassallo/s3-benchmark, 155 instance types. The 90th percentile time to first byte is around 20 ms from an in-region EC2 instance, and one thread moves about 93 MB/s."
@@ -319,6 +357,11 @@ latency:
   # A search ends when its slowest read returns. Measured as the p99 of
   # {searches} searches, divided by the small-read p99.
   fanout_tail_factor: {fanout_tail_factor}
+
+  # The p99 of {deletes} delete requests: the visibility checks' single-key
+  # deletes and the merges' bulk deletes. A delete moves no bytes, but S3
+  # updates its index for every key, so it is slower than a small read.
+  delete_p99_s: {delete_p99_s}
 
 throughput:
   # Median speed of {downloads} whole-file downloads, one stream each, in MiB/s.
@@ -344,5 +387,6 @@ def render_profile(values, profile_id=DEFAULT_PROFILE, version=1):
         searches=values["counts"]["searches"],
         downloads=values["counts"]["downloads"],
         uploads=values["counts"]["uploads"],
+        deletes=values["counts"]["deletes"],
         **{k: v for k, v in values.items() if k != "counts"},
     )

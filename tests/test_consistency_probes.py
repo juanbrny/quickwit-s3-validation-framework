@@ -37,3 +37,9 @@ def test_delete_visibility_probe_succeeds(moto_s3):
     c = _client()
     result = probe_delete_visibility(c, TEST_BUCKET, "test/consistency")
     assert result["success"], result
+
+
+def test_delete_visibility_probe_times_its_delete(moto_s3):
+    """The profile command measures AWS delete latency from these timings."""
+    result = probe_delete_visibility(_client(), TEST_BUCKET, "test/consistency")
+    assert result["delete_latency_s"] > 0

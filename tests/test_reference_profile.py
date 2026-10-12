@@ -129,7 +129,7 @@ MIB = 1024 * 1024
 
 def _aws_run(tmp_path, download_mib_s=90.0, upload_mib_s=70.0, small_p50=0.020,
              endpoint="https://s3.us-east-1.amazonaws.com", pauses=None,
-             idle_p50=0.025, searches=2000):
+             idle_p50=0.025, searches=2000, deletes=300, delete_s=0.25):
     """A finished AWS run with known speeds, so the derived numbers are checkable."""
     from examples.make_sample_report import make_bundle
     from src.run_store import digest, read_json, write_json
@@ -151,6 +151,11 @@ def _aws_run(tmp_path, download_mib_s=90.0, upload_mib_s=70.0, small_p50=0.020,
         for op, rate in (("get_object_full", download_mib_s), ("put_object", upload_mib_s)):
             ingest.append({"ts": t + i, "worker": "indexer-0", "op": op, "ok": True,
                            "latency_s": small_p50 + size / MIB / rate, "bytes": size, "error": None})
+    probes = [{"probe": "delete_visibility", "ts": t + i, "delete_ok": True, "is_gone": True,
+               "success": True, "within_deadline": True, "elapsed_s": delete_s + 0.05,
+               "delete_latency_s": delete_s * (0.8 + 0.4 * rng.random())}
+              for i in range(deletes)]
+    (run / "consistency.jsonl").write_text("".join(json.dumps(r) + "\n" for r in probes))
     (run / "query.jsonl").write_text("".join(json.dumps(r) + "\n" for r in query))
     (run / "ingest_merge.jsonl").write_text("".join(json.dumps(r) + "\n" for r in ingest))
     manifest = read_json(run / "manifest.json")
@@ -167,7 +172,7 @@ def _aws_run(tmp_path, download_mib_s=90.0, upload_mib_s=70.0, small_p50=0.020,
             level["p50_per_request_s"] = idle_p50
     write_json(run / "fanout.json", fanout)
     manifest["stages"]["fanout"]["artifacts"]["fanout.json"] = digest(run / "fanout.json")
-    for name in ("query.jsonl", "ingest_merge.jsonl"):
+    for name in ("query.jsonl", "ingest_merge.jsonl", "consistency.jsonl"):
         load["artifacts"][name] = digest(run / name)
     write_json(run / "manifest.json", manifest)
     return run
@@ -251,3 +256,34 @@ def test_a_run_that_missed_its_search_rate_is_refused(tmp_path):
     values, errors, _ = derive_profile(_aws_run(tmp_path, searches=1000))
     assert values is None
     assert any("could not generate its own workload" in e for e in errors)
+
+
+def test_deletes_are_graded_against_their_own_figure():
+    """
+    Graded as small reads, AWS S3 itself failed: from an m5a.8xlarge in
+    us-east-1, bulk deletes of 10 keys took about 300 ms, against a limit of
+    255 ms (85 ms x 3).
+    """
+    profile = load_profile()
+    assert reference_p99(profile, "delete_objects_bulk", 0) == profile["latency"]["delete_p99_s"]
+    assert reference_p99(profile, "delete_objects_bulk", 0) * 3.0 > 0.301
+    # A flavor without bulk delete sends one request for each key.
+    assert reference_p99(profile, "delete_object_loop", 0, 10) == pytest.approx(
+        10 * profile["latency"]["delete_p99_s"])
+
+
+def test_the_profile_measures_deletes_from_the_visibility_checks(tmp_path):
+    values, errors, _ = derive_profile(_aws_run(tmp_path, delete_s=0.25))
+    assert errors == []
+    assert 0.25 < values["delete_p99_s"] <= 0.30
+    assert values["counts"]["deletes"] == 300
+    path = tmp_path / "profile.yaml"
+    path.write_text(render_profile(values, version=3))
+    assert load_profile(str(path))["latency"]["delete_p99_s"] == values["delete_p99_s"]
+
+
+def test_a_run_without_timed_deletes_is_refused(tmp_path):
+    """The first AWS run on the load engine had 4 merge deletes and no timed probes."""
+    values, errors, _ = derive_profile(_aws_run(tmp_path, deletes=0))
+    assert values is None
+    assert any("deletes" in e and "Record a new run" in e for e in errors)

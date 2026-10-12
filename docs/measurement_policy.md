@@ -121,9 +121,9 @@ Headroom is the measurement divided by its own limit. For an "at least" requirem
 
 Throughput counts successful original indexer writes only. It excludes merge rewrite bytes. The rate is measured in MiB/s and compared against the modelled indexed-byte ingestion rate, not against all S3 traffic and not against raw log volume.
 
-Every complete window must reach 95% of its target. Idle windows count as zero throughput. A partial final window appears in the timeline but is not decided. Startup is included; mixed-workload measurements have no hidden warm-up exclusion.
+Every complete window must reach 95% of its target. Idle windows count as zero throughput. A partial final window appears in the timeline but is not decided. Startup is included for writes.
 
-Successful simulated query rate is evaluated separately, the same way.
+Successful simulated query rate is evaluated separately, the same way, with one difference. A search needs a file to search, so both load engines skip searches until the first upload finishes. The search rate therefore counts only the time after the first upload. In the window where the first upload finishes, the searches are divided by the seconds after that upload. A window with less than half its time after the first upload is not counted. Without this rule, AWS S3 failed at 10TB: 37.72 against 38.0 searches per second, because the engine skipped 134 searches in the first 3 seconds.
 
 ## Throttling
 
@@ -172,7 +172,7 @@ A profile holds a few numbers, not a table of per-operation latencies. These thr
 | Field | Meaning |
 |---|---|
 | `latency.first_byte_p99_s` | The 99th percentile of one small request, measured in region. This is a tail figure, because the framework compares p99 to p99. |
-| `throughput.per_stream_mb_s` | The rate one request transfers bytes at. AWS advises one concurrent request for each 85-90 MB/s wanted. |
+| `throughput.per_stream_mb_s` | The rate one request transfers bytes at, in the slow case: 99 of 100 transfers are faster. A typical rate is too fast for a p99 reference. From an EC2 instance in us-east-1, merge reads of 189 MiB moved at about 90 MiB/s in the median, and at about 42 MiB/s in the slowest 1%. With the median rate, AWS S3 failed its own reference by 5%. |
 | `latency.delete_p99_s` | The 99th percentile of one delete request, measured in region. |
 
 The limit for one operation then follows its own recorded payload size:
@@ -189,6 +189,8 @@ Two numbers therefore cover every read and upload at every tier, including tiers
 Queries are the exception. A query finishes when the slowest of its concurrent reads returns, and the 99th percentile of that maximum sits above the 99th percentile of one read. `latency.fanout_tail_factor` covers the difference. In a provisional profile it is an assumption. In a profile written by `run_validation.py profile` it is measured: the p99 of whole searches, divided by the p99 of small reads.
 
 Deletes are the other exception. A delete moves no bytes, but S3 updates its index for every key, so it is slower than a small read. A bulk delete uses `latency.delete_p99_s` as its reference. A flavor without bulk delete sends one request per key, so its reference is `delete_p99_s` times the number of keys in one merge, `merge_factor`. Version 1 of the bundled profile graded deletes as small reads, and AWS S3 itself failed: its bulk deletes of 10 keys took about 300 ms, against a limit of 255 ms. A profile without `delete_p99_s` still grades deletes as small reads.
+
+A run graded against a profile made from that same run must pass. `tests/test_reference_profile.py` checks this with slow transfers in the sample, and checks that the median rate fails it.
 
 Uploads can be slower than downloads. A measured profile records `throughput.upload_per_stream_mb_s` for uploads. An older profile without it uses `per_stream_mb_s` for both. How to record a new profile is in [Run a validation](run_a_validation.md#refresh-the-aws-reference-profile).
 

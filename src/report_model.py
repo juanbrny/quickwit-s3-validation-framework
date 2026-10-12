@@ -901,6 +901,28 @@ def build_report(
             start + w["offset_s"], start + w["offset_s"] + w["duration_s"], paused_at
         )
     full = [w for w in windows if w["complete"] and not w["paused"]]
+    # A search needs a file to search. Until the first upload finishes, both
+    # load engines skip their searches, so the first minute counted fewer
+    # searches than the target. At 40 searches per second, AWS S3 failed by
+    # this alone: the engine skipped 134 searches in the first 3 seconds. So
+    # the search rate counts only the time after the first upload.
+    first_upload = min(
+        (
+            r["ts"] for r in rows
+            if r["ok"]
+            and r.get("worker", "").startswith("indexer-")
+            and r["op"] in ("put_object", "multipart_upload")
+        ),
+        default=None,
+    )
+    searchable = []
+    for w in full:
+        begin, end = start + w["offset_s"], start + w["offset_s"] + w["duration_s"]
+        if first_upload is None or end - max(begin, first_upload) < seconds / 2:
+            continue  # nothing to search for most of this window
+        searchable.append(
+            {**w, "query_qps": w["query_qps"] * w["duration_s"] / (end - max(begin, first_upload))}
+        )
     sufficient = len(full) >= min_windows
     for key, title, field, requirement in (
         (
@@ -918,7 +940,9 @@ def build_report(
             / 100,
         ),
     ):
-        values = [w[field] for w in full if w[field] is not None]
+        counted = full if key == "throughput" else searchable
+        enough = len(counted) >= min_windows
+        values = [w[field] for w in counted if w[field] is not None]
         observed = min(values) if values else None
         has_samples = (
             any(r.get("worker", "").startswith("indexer-") for r in rows)
@@ -929,7 +953,7 @@ def build_report(
             NOT_RUN
             if not load or not has_samples
             else INCONCLUSIVE
-            if not sufficient or observed is None
+            if not enough or observed is None
             else PASS
             if observed >= requirement
             else FAIL
@@ -939,8 +963,10 @@ def build_report(
             seen = "No complete 60-second window"
         else:
             seen = f"Worst complete window: {observed:.2f}{unit}"
-            if not sufficient:
-                seen += f" (only {len(full)} of {min_windows} needed windows)"
+            if key == "query_rate" and first_upload is not None and first_upload > start:
+                seen += f", counted from the first upload at {first_upload - start:.1f} s"
+            if not enough:
+                seen += f" (only {len(counted)} of {min_windows} needed windows)"
         add(
             key,
             title,

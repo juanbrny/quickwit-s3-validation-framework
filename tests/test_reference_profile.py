@@ -130,7 +130,8 @@ MIB = 1024 * 1024
 def _aws_run(tmp_path, download_mib_s=90.0, upload_mib_s=70.0, small_p50=0.020,
              endpoint="https://s3.us-east-1.amazonaws.com", pauses=None,
              idle_p50=0.025, searches=2000, deletes=300, delete_s=0.25,
-             round_trip_ms=None):
+             round_trip_ms=None, transfers=150, slow_fraction=0.0, slow_factor=0.2,
+             merge_deletes=0, merge_delete_s=0.45):
     """A finished AWS run with known speeds, so the derived numbers are checkable."""
     from examples.make_sample_report import make_bundle
     from src.run_store import digest, read_json, write_json
@@ -148,14 +149,21 @@ def _aws_run(tmp_path, download_mib_s=90.0, upload_mib_s=70.0, small_p50=0.020,
                       "latency_s": small_p50 * (2 + rng.random()), "bytes": 0, "error": None})
     size = 132 * MIB
     ingest = []
-    for i in range(40):
+    for i in range(transfers):
         for op, rate in (("get_object_full", download_mib_s), ("put_object", upload_mib_s)):
+            # A few transfers run far slower, as real S3 transfers do.
+            if rng.random() < slow_fraction:
+                rate *= slow_factor
             ingest.append({"ts": t + i, "worker": "indexer-0", "op": op, "ok": True,
                            "latency_s": small_p50 + size / MIB / rate, "bytes": size, "error": None})
     probes = [{"probe": "delete_visibility", "ts": t + i, "delete_ok": True, "is_gone": True,
                "success": True, "within_deadline": True, "elapsed_s": delete_s + 0.05,
                "delete_latency_s": delete_s * (0.8 + 0.4 * rng.random())}
               for i in range(deletes)]
+    for i in range(merge_deletes):
+        ingest.append({"ts": t + i, "worker": "merger-0", "op": "delete_objects_bulk", "ok": True,
+                       "latency_s": merge_delete_s * (0.8 + 0.4 * rng.random()), "bytes": 0,
+                       "error": None})
     (run / "consistency.jsonl").write_text("".join(json.dumps(r) + "\n" for r in probes))
     (run / "query.jsonl").write_text("".join(json.dumps(r) + "\n" for r in query))
     (run / "ingest_merge.jsonl").write_text("".join(json.dumps(r) + "\n" for r in ingest))
@@ -293,3 +301,52 @@ def test_a_run_without_timed_deletes_is_refused(tmp_path):
     values, errors, _ = derive_profile(_aws_run(tmp_path, deletes=0))
     assert values is None
     assert any("deletes" in e and "Record a new run" in e for e in errors)
+
+
+def test_an_aws_run_passes_against_a_profile_made_from_itself(tmp_path, monkeypatch):
+    """
+    The reference run must agree with itself. A 90-minute AWS run at 10TB
+    failed its merge reads: 4,610 ms against a limit of 4,373 ms. The profile
+    took the median speed, so its "p99" described a typical transfer, and the
+    slowest 1% of S3 transfers ran at less than half that speed.
+    """
+    from src import reference_profile
+    from src.report_model import build_report
+
+    run = _aws_run(tmp_path, slow_fraction=0.03, slow_factor=0.3)
+
+    def grade(name):
+        values, errors, _ = derive_profile(run)
+        assert errors == []
+        path = tmp_path / name
+        path.write_text(render_profile(values, version=3))
+        report = build_report(run, reference=str(path))
+        return {c["id"]: c["status"] for c in report["checks"] if c["id"].endswith("_p99")}
+
+    statuses = grade("slow-case.yaml")
+    assert statuses and set(statuses.values()) == {"PASS"}, statuses
+    # The median speed, as before, fails AWS S3 against its own figures.
+    monkeypatch.setattr(reference_profile, "SLOW_SPEED_PCT", 50)
+    assert grade("median.yaml")["get_object_full_p99"] == "FAIL"
+
+
+def test_a_profile_needs_100_large_transfers_of_each_kind(tmp_path):
+    """The speed 99 of 100 transfers beat is not measurable from 40 transfers."""
+    values, errors, _ = derive_profile(_aws_run(tmp_path, transfers=40))
+    assert values is None
+    assert any("Only 40 large downloads" in e and "--tier 10TB" in e for e in errors)
+
+
+def test_deletes_come_from_the_merges_when_the_run_has_enough(tmp_path):
+    """
+    The report grades the merges' 10-key deletes. A single-key delete from the
+    visibility checks is faster, so it only fills in when merges are too few.
+    """
+    run = _aws_run(tmp_path / "long", merge_deletes=120, merge_delete_s=0.45)
+    values, errors, _ = derive_profile(run)
+    assert errors == []
+    assert values["delete_p99_s"] > 0.45 and values["counts"]["deletes"] == 120
+    assert "the merges' bulk deletes" == values["delete_source"]
+    short = _aws_run(tmp_path / "short", merge_deletes=4)
+    values, _, _ = derive_profile(short)
+    assert values["counts"]["deletes"] == 304 and "single-key" in values["delete_source"]

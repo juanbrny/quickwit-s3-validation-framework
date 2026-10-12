@@ -51,7 +51,11 @@ latency:
 
 throughput:
   # One request, one stream. AWS tells applications to open one concurrent
-  # request for each 85-90 MB/s they want.
+  # request for each 85-90 MB/s they want. That is a typical speed, but the
+  # report compares p99 with p99, so this value should be the slow case: the
+  # speed 99 of 100 transfers beat. From an m5a.8xlarge in us-east-1, the
+  # slowest 1% of 189 MiB merge reads moved at about 42 MiB/s, and AWS S3
+  # failed against 90. A measured profile replaces this value.
   per_stream_mb_s: 90.0
 
   # Quickwit uploads above 128 MiB as multipart, with a 5 GiB target part size

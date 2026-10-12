@@ -1299,3 +1299,28 @@ def test_the_report_counts_its_deciding_checks_instead_of_stating_them(bundle):
     html = render_html(report)
     assert f"{deciding} checks decide the result" in html
     assert "Ten checks" not in html
+
+
+def test_searches_count_from_the_first_upload(bundle):
+    """
+    Regression test. A 90-minute AWS run at 10TB failed its search rate:
+    37.72 against 38.0 per second, in the first minute only. Until the first
+    upload finished there was nothing to search, so the engine skipped 134
+    searches. The storage was blamed for the tool's own start.
+    """
+    manifest = read_json(bundle / "manifest.json")
+    start = manifest["stages"]["load"]["measurement_started_epoch"]
+    first_upload = start + 10
+    for name in ("query.jsonl", "ingest_merge.jsonl"):
+        rows = [json.loads(line) for line in (bundle / name).read_text().splitlines()]
+        rows = [
+            r for r in rows
+            if r["ts"] >= first_upload
+            or not (r["op"] == "query_wall_clock" or r["worker"].startswith("indexer-"))
+        ]
+        (bundle / name).write_text("".join(json.dumps(r) + "\n" for r in rows))
+        manifest["stages"]["load"]["artifacts"][name] = digest(bundle / name)
+    write_json(bundle / "manifest.json", manifest)
+    result = indexed(build_report(bundle))["query_rate"]
+    assert result["status"] == "PASS", result["observed"]
+    assert "counted from the first upload at 1" in result["observed"]

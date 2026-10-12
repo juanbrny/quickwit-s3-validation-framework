@@ -547,6 +547,7 @@ def cmd_profile(args, parser):
     print(f"  {'value':<24}{'before':>10}{'now':>10}")
     for section, field in (
         ("latency", "first_byte_p99_s"), ("latency", "fanout_tail_factor"),
+        ("latency", "delete_p99_s"),
         ("throughput", "per_stream_mb_s"), ("throughput", "upload_per_stream_mb_s"),
     ):
         print(f"  {field:<24}{before(section, field)!s:>10}{values[field]!s:>10}")

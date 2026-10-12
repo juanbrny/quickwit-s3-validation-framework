@@ -285,8 +285,10 @@ export QW_S3_BUCKET=your-aws-bucket
 export QW_S3_ACCESS_KEY=...
 export QW_S3_SECRET_KEY=...
 
-byoc-s3 validate --flavor aws --tier 1TB --duration-min 30 --runner-location "ec2 c7i.2xlarge us-east-1" --run-dir reports/aws-profile-run
+byoc-s3 validate --flavor aws --tier 10TB --duration-min 90 --runner-location "ec2 c7i.2xlarge us-east-1" --run-dir reports/aws-profile-run
 ```
+
+Use `10TB` for 90 minutes. The profile needs at least 100 downloads and 100 uploads of 16 MiB or more, and a `1TB` run of 30 minutes has far fewer. A 90-minute `10TB` run has more than 1,000 of each, and more than 100 merge deletes.
 
 
 3. **Copy the run directory back to your own machine**, for example with `scp -r`. Keep it: it is the evidence behind the new figures.
@@ -304,7 +306,7 @@ It refuses a run that cannot give honest figures:
 - the endpoint is not AWS S3;
 - a step did not finish;
 - the machine paused;
-- there are too few samples, including fewer than 100 timed deletes. Runs recorded before the visibility checks timed their deletes have too few;
+- there are too few samples: fewer than 100 small reads, searches, timed deletes, large downloads or large uploads. Runs recorded before the visibility checks timed their deletes have too few deletes;
 - small reads were more than twice as slow during the workload as in the idle read test, so the test machine was overloaded;
 - the run sent less than 90% of the searches per second its tier asks for.
 
@@ -316,11 +318,17 @@ It measures five values:
 |---|---|
 | `first_byte_p99_s` | The p99 of the small reads, 2 KiB and 8 KiB. |
 | `fanout_tail_factor` | The p99 of whole searches, divided by the small-read p99. |
-| `per_stream_mb_s` | The median speed of whole-file downloads, one stream each. |
-| `upload_per_stream_mb_s` | The median speed of uploads, one stream each. |
-| `delete_p99_s` | The p99 of the delete requests. Most come from the visibility checks, which delete one key every few seconds. The others are the merges' bulk deletes. |
+| `per_stream_mb_s` | The slow-case speed of whole-file downloads, one stream each: 99 of 100 downloads were faster. |
+| `upload_per_stream_mb_s` | The slow-case speed of uploads, one stream each: 99 of 100 uploads were faster. |
+| `delete_p99_s` | The p99 of the merges' bulk deletes, which the report grades. When the run has fewer than 100 of them, the visibility checks' single-key deletes, one every few seconds, fill the gap. |
 
 Only transfers of at least 16 MiB count toward a speed. On a smaller transfer, the time after the first byte is too short to measure a speed from.
+
+Every value describes the slow case, because the report compares the p99 of each operation with a reference p99. A run graded against a profile made from itself therefore passes. Check this before you commit a new profile:
+
+```bash
+byoc-s3 report --run-dir reports/aws-profile-run --reference config/reference_profiles/aws-s3-ec2-same-region.yaml
+```
 
 ## Run the steps one by one
 

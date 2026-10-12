@@ -148,8 +148,9 @@ def describe(profile):
 #
 #   first_byte_p99_s       p99 of the small reads (2 KiB and 8 KiB)
 #   fanout_tail_factor     search p99 / small-read p99
-#   per_stream_mb_s        median speed of whole-file downloads, one stream each
-#   upload_per_stream_mb_s median speed of single-stream uploads
+#   per_stream_mb_s        slow-case speed of whole-file downloads, one stream
+#                          each: 99 of 100 downloads were faster
+#   upload_per_stream_mb_s slow-case speed of single-stream uploads
 #   delete_p99_s           p99 of the delete requests: the visibility checks'
 #                          single-key deletes, and the merges' bulk deletes
 #
@@ -158,8 +159,14 @@ def describe(profile):
 
 SMALL_READS = ("get_term_or_field", "get_doc")
 DOWNLOADS = ("get_object_full",)
-MIN_SAMPLES = {"small reads": 100, "searches": 100, "downloads": 10, "uploads": 10,
+MIN_SAMPLES = {"small reads": 100, "searches": 100, "downloads": 100, "uploads": 100,
                "deletes": 100}
+# The speed that 99 of 100 transfers beat. The report compares a measured p99
+# with a reference p99, so the reference must describe the slow case too. The
+# median speed did not: from an EC2 instance in the region, the median merge
+# read of 189 MiB moved at about 90 MiB/s, but the slowest 1% at about 42.
+# With the median, AWS S3 failed its own reference by 5%.
+SLOW_SPEED_PCT = 1
 IN_REGION_MEDIAN_S = 0.050  # a small read from inside the region is far faster
 # A single test process can only send so many requests before its own work
 # slows every request down. Small reads during the workload may then take far
@@ -234,11 +241,16 @@ def derive_profile(run_dir):
             and r["latency_s"] - small_p50 >= TRANSFER_DOMINATES * small_p50
         )
 
-    # A 30-minute run has only a few merge deletes, so most delete samples
-    # come from the visibility checks, which delete one key every few seconds.
+    # The report grades the merges' bulk deletes, so measure those when the
+    # run has enough. A 30-minute run has only a few, so the visibility
+    # checks' single-key deletes, one every few seconds, fill the gap. A
+    # single-key delete is faster than a 10-key one, so the mix is a weaker
+    # figure.
     deletes = [r["latency_s"] for r in ok if r["op"] in BULK_DELETE_OPS]
+    delete_source = "the merges' bulk deletes"
     probes = run_dir / "consistency.jsonl"
-    if probes.exists():
+    if len(deletes) < MIN_SAMPLES["deletes"] and probes.exists():
+        delete_source = "the merges' bulk deletes and the visibility checks' single-key deletes"
         for line in probes.read_text().splitlines():
             probe = json.loads(line) if line.strip() else {}
             if probe.get("delete_ok") and isinstance(probe.get("delete_latency_s"), (int, float)):
@@ -254,6 +266,8 @@ def derive_profile(run_dir):
         if counts[name] < need:
             kind = f"large {name} (at least {LARGE_TRANSFER_MIB} MiB)" if name in ("downloads", "uploads") else name
             message = f"Only {counts[name]} {kind}; at least {need} are needed."
+            if name in ("downloads", "uploads"):
+                message += " A 90-minute run at --tier 10TB records more than 1,000 of each."
             if name == "deletes":
                 message += (
                     " Runs recorded before the visibility checks timed their deletes"
@@ -304,7 +318,7 @@ def derive_profile(run_dir):
             for r in transfers
             if r["latency_s"] > first_byte_p50
         ]
-        return _percentile(rates, 50) if rates else None
+        return _percentile(rates, SLOW_SPEED_PCT) if rates else None
 
     values = {
         "first_byte_p99_s": round(first_byte_p99, 4),
@@ -312,6 +326,7 @@ def derive_profile(run_dir):
         "per_stream_mb_s": round(speed(downloads), 1),
         "upload_per_stream_mb_s": round(speed(uploads), 1),
         "delete_p99_s": round(_percentile(deletes, 99), 4),
+        "delete_source": delete_source,
         "counts": counts,
         "small_read_p50_s": round(first_byte_p50, 4),
         "run_id": manifest["run_id"],
@@ -367,16 +382,18 @@ latency:
   # {searches} searches, divided by the small-read p99.
   fanout_tail_factor: {fanout_tail_factor}
 
-  # The p99 of {deletes} delete requests: the visibility checks' single-key
-  # deletes and the merges' bulk deletes. A delete moves no bytes, but S3
-  # updates its index for every key, so it is slower than a small read.
+  # The p99 of {deletes} delete requests: {delete_source}. A delete moves no
+  # bytes, but S3 updates its index for every key, so it is slower than a
+  # small read.
   delete_p99_s: {delete_p99_s}
 
 throughput:
-  # Median speed of {downloads} whole-file downloads, one stream each, in MiB/s.
+  # The slow-case speed of {downloads} whole-file downloads, one stream each,
+  # in MiB/s: 99 of 100 were faster. Limits compare p99 with p99, so the
+  # speed must describe the slow case, not the typical one.
   per_stream_mb_s: {per_stream_mb_s}
 
-  # Median speed of {uploads} single-stream uploads, in MiB/s.
+  # The slow-case speed of {uploads} single-stream uploads, in MiB/s.
   upload_per_stream_mb_s: {upload_per_stream_mb_s}
 
   # BYOC uploads above 128 MiB as multipart, with a 5 GiB target part size,

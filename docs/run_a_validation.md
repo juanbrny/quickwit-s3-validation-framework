@@ -162,6 +162,34 @@ If that line names the wrong source, set `QW_S3_ACCESS_KEY` and `QW_S3_SECRET_KE
 
 Temporary keys start with `ASIA`. They only work together with a session token. Set `$AWS_SESSION_TOKEN`, or pass `--session-token`.
 
+### Use a private certificate authority
+
+On-premises storage often uses a certificate from a private certificate authority (CA). The tool then needs a file with that authority's certificate, in PEM format. Give it in one of two ways:
+
+- the `--ca-bundle` option, for example `--ca-bundle /home/me/certs/ca-bundle.pem`;
+- or a line in your connection file: `export QW_S3_CA_BUNDLE=/home/me/certs/ca-bundle.pem`. The tool also reads `$AWS_CA_BUNDLE` when `$QW_S3_CA_BUNDLE` is not set.
+
+The tool runs in a container, so the path must be one the container can see:
+
+- **A full path**, starting with `/`, works anywhere. `byoc-s3` mounts the file into the container, read-only.
+- **A relative path** works only inside the current folder, for example `certs/ca-bundle.pem`. `byoc-s3` mounts the current folder.
+- **A path out of the current folder**, such as `../ca-bundle.pem`, does not work. Use the full path instead.
+
+The file replaces the authorities the tool trusts by default. It does not add to them. A file with only your private authority is enough for your storage. Include the whole chain: the root authority and every intermediate authority between it and the storage certificate.
+
+The certificate must name the address in `QW_S3_ENDPOINT`. If you connect by host name, that name must be in the certificate. If you connect by IP address, the certificate needs that address as a subject alternative name (SAN).
+
+Check the certificate before a run. It takes a few seconds:
+
+```bash
+curl --cacert /home/me/certs/ca-bundle.pem https://s3.example.com/
+```
+
+- An XML answer, such as `AccessDenied`, means the certificate is trusted. The tool will connect.
+- A certificate error means the file lacks an authority of the chain, or the certificate does not name the address. Fix it before you start a run.
+
+Do not use `--insecure-skip-tls-verify` to work around a certificate problem. It works only with `--engine python` at `100GB`, and the report then says that the connection was not checked.
+
 ## Step 2: a one-minute test
 
 Run this first, every time. It proves the keys, the bucket and the address all work, before you start a long test.
@@ -218,7 +246,7 @@ The tool still tests your choice first. If it fails a compatibility check, the r
 
 ### Use HTTPS if production uses HTTPS
 
-Over plain `http://`, uploads send their checksum in a different way than over `https://`. Some storage systems accept one way and reject the other. StorageGRID's documentation lists the HTTPS way as unsupported. So a test over HTTP can pass with settings that fail in production. Test over the same protocol that production uses. If the certificate comes from a private authority, add `--ca-bundle`.
+Over plain `http://`, uploads send their checksum in a different way than over `https://`. Some storage systems accept one way and reject the other. StorageGRID's documentation lists the HTTPS way as unsupported. So a test over HTTP can pass with settings that fail in production. Test over the same protocol that production uses. If the certificate comes from a private authority, see [Use a private certificate authority](#use-a-private-certificate-authority).
 
 ### Choose the daily volume
 
@@ -239,7 +267,7 @@ Over plain `http://`, uploads send their checksum in a different way than over `
 | `--flavor NAME` | Test these settings instead of the ones step 2 picks. |
 | `--keep-objects` | Leave the test objects in the bucket. |
 | `--levels 1,8,16,32` | Test fewer concurrency levels. |
-| `--ca-bundle PATH` | Trust a private certificate authority. On-premises storage usually needs this. |
+| `--ca-bundle PATH` | Trust a private certificate authority. On-premises storage usually needs this. See [Use a private certificate authority](#use-a-private-certificate-authority). |
 | `--insecure-skip-tls-verify` | Skip the certificate check. The report records that you did. Works only with `--engine python`. |
 | `--engine rust` or `--engine python` | Choose the load engine. By default, the load engine when it is built, and Python for `100GB` otherwise. |
 | `--strict` | Exit with status 1 when the result is not PASS. Useful in automated pipelines. |
@@ -403,7 +431,7 @@ Keep `report-evidence/` next to `report.html`, or the download links break.
 | `Could not connect to the endpoint, so no check ran` | Nothing was tested. Read the "Likely cause" line under the message. |
 | `SignatureDoesNotMatch` | The secret key does not belong to the access key. Check the "keys from" line at the start of the run. |
 | `InvalidToken` or `ExpiredToken` | Temporary keys need a valid session token. See [Where the keys come from](#where-the-keys-come-from). |
-| `SSLError` or `CERTIFICATE_VERIFY_FAILED` | Pass `--ca-bundle /path/to/ca.pem`. |
+| `SSLError` or `CERTIFICATE_VERIFY_FAILED` | Pass `--ca-bundle` with the full path of your authority's certificate. See [Use a private certificate authority](#use-a-private-certificate-authority). |
 | `No flavor passed every compatibility check` | The tool connected, but no known settings work. Open `compat.md` in the run directory to see which check failed. |
 | `The 1TB tier needs the Rust load engine` | Only when you run from source. Build the engine. See [Run from source](#run-from-source). |
 | `Name or service not known`, or no connection to `localhost` | On macOS, use `host.docker.internal` instead of `localhost`. If the storage system has no host name for each bucket, the compatibility step picks settings with path-style addresses. |

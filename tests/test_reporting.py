@@ -115,8 +115,10 @@ def test_zero_operations_never_certifies(bundle):
 def test_report_uses_saved_thresholds_and_detects_flavor_mismatch(bundle, tmp_path):
     baseline = make_bundle(tmp_path / "aws", True)
     manifest = read_json(bundle / "manifest.json")
+    # The sample's searches are about 4.8 times slower than its AWS run, so
+    # they fail at the default 2.5 and pass only with the saved 5.0.
     manifest["config"]["pass_fail_bands"]["query_wall_clock_p99_multiplier_vs_aws"] = (
-        3.5
+        5.0
     )
     manifest["stages"]["put-fanout"]["options"]["flavor"] = "none"
     write_json(bundle / "manifest.json", manifest)
@@ -911,7 +913,7 @@ def test_a_vendor_without_aws_still_gets_graded_latency(bundle):
     assert indexed(report)["baseline"]["status"] == "PASS"
     # The report must say the bar is published, not measured next to this run.
     titles = [item["title"] for item in report["headline_limits"]]
-    assert "Latency is graded against published figures" in titles
+    assert "Latency is graded against the AWS reference profile" in titles
     assert "reference profile" in render_html(report)
 
 
@@ -921,7 +923,7 @@ def test_a_measured_baseline_overrides_the_bundled_profile(bundle, tmp_path):
     assert report["reference"]["basis"] == "measured baseline"
     assert report["reference"]["profile"] is None
     titles = [item["title"] for item in report["headline_limits"]]
-    assert "Latency is graded against published figures" not in titles
+    assert "Latency is graded against the AWS reference profile" not in titles
 
 
 def test_reference_none_keeps_latency_inconclusive(bundle):

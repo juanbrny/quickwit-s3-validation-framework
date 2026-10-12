@@ -103,9 +103,9 @@ pass_fail_bands:
 # machine". 1PB and 10PB need several machines, so they have no entry.
 test_machine:
   # A same-region EC2 instance is about 1 ms from AWS S3. A small read may
-  # take 85 ms more than AWS before it fails, and a new HTTPS connection
+  # take 65 ms more than AWS before it fails, and a new HTTPS connection
   # waits for the network two or three times. At 10 ms, the network alone
-  # can use a third of that margin.
+  # can use up to half of that margin.
   max_round_trip_ms: 10
   tiers:
     100GB: {cores: 2, memory_gb: 4, disk_gb: 1}

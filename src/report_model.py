@@ -236,6 +236,8 @@ def machine_checks(facts, cfg, tier):
     need = requirement(cfg, tier)
     if not facts:
         size_state, size_seen = NOT_RUN, "No machine check recorded"
+        if "test_machine" not in cfg:
+            size_seen += ". This run is older than the machine check"
     else:
         size_state = INCONCLUSIVE if size else PASS
         size_seen = " ".join(size) if size else (
@@ -252,7 +254,9 @@ def machine_checks(facts, cfg, tier):
         f"At least {need['cores']} cores, {need['memory_gb']} GB memory and"
         f" {need['disk_gb']} GB free disk for {tier}"
         if need
-        else f"No single machine is recommended for {tier}",
+        else f"No single machine is recommended for {tier}"
+        if "test_machine" in cfg
+        else "Machine sizes were not saved with this run",
         "A machine smaller than recommended can become the limit. Then response"
         " times and rates describe the machine, not the storage. Network"
         " bandwidth is not checked.",
@@ -265,6 +269,8 @@ def machine_checks(facts, cfg, tier):
     if trip.get("min_ms") is None:
         state = NOT_RUN
         seen = trip.get("error") or "No round trip recorded"
+        if not facts and "test_machine" not in cfg:
+            seen += ". This run is older than the machine check"
     else:
         state = INCONCLUSIVE if most and trip["min_ms"] > most else PASS
         seen = (
@@ -1615,13 +1621,14 @@ def build_report(
     if profile:
         headline_limits.append(
             {
-                "title": "Latency is graded against published figures",
+                "title": "Latency is graded against the AWS reference profile",
                 "detail": "No measured AWS run was supplied, so latency limits"
                 f" come from reference profile {profile['id']} v{profile['version']}."
-                " The profile states what AWS S3 delivers from an in-region"
-                " instance. It cannot account for this runner's own network"
-                " distance to the endpoint. Supply --baseline with a measured"
-                " AWS run for a side-by-side comparison.",
+                " The profile holds what AWS S3 delivers to a machine in the"
+                " same region, about 1 ms away. A test machine far from the"
+                " storage adds network time to every response time: see"
+                " \"Network distance to the storage\" below. Supply --baseline"
+                " with a measured AWS run for a side-by-side comparison.",
             }
         )
     headline_limits.append(

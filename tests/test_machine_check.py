@@ -165,3 +165,18 @@ def test_a_small_machine_gets_a_headline_note(tmp_path):
     assert indexed(report)["machine_size"]["status"] == "INCONCLUSIVE"
     titles = [h["title"] for h in report["headline_limits"]]
     assert "The test machine is smaller than recommended" in titles
+
+
+def test_a_run_older_than_the_machine_check_says_so(tmp_path):
+    """Its saved settings have no machine sizes. That is not a 10TB problem."""
+    bundle = make_bundle(tmp_path / "vendor")
+    manifest = read_json(bundle / "manifest.json")
+    del manifest["stages"]["machine"]
+    del manifest["config"]["test_machine"]
+    write_json(bundle / "manifest.json", manifest)
+    checks = indexed(build_report(bundle))
+    size = checks["machine_size"]
+    assert size["status"] == "NOT RUN"
+    assert "older than the machine check" in size["observed"]
+    assert size["requirement"] == "Machine sizes were not saved with this run"
+    assert "older than the machine check" in checks["network_distance"]["observed"]

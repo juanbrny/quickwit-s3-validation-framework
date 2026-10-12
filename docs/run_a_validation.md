@@ -306,17 +306,18 @@ It refuses a run that cannot give honest figures:
 - the endpoint is not AWS S3;
 - a step did not finish;
 - the machine paused;
-- there are too few samples: fewer than 100 small reads, searches, timed deletes, large downloads or large uploads. Runs recorded before the visibility checks timed their deletes have too few deletes;
+- there are too few samples: fewer than 100 small reads, footer reads, searches, timed deletes, large downloads or large uploads. Runs recorded before the visibility checks timed their deletes have too few deletes;
 - small reads were more than twice as slow during the workload as in the idle read test, so the test machine was overloaded;
 - the run sent less than 90% of the searches per second its tier asks for.
 
 It warns when small reads look too slow to come from inside the region.
 
-It measures five values:
+It measures six values:
 
 | Value | Measured as |
 |---|---|
 | `first_byte_p99_s` | The p99 of the small reads, 2 KiB and 8 KiB. |
+| `footer_p99_s` | The p99 of the split footer reads. A footer read is the first read of a file just after its upload, and S3 answers it more slowly than other small reads. |
 | `fanout_tail_factor` | The p99 of whole searches, divided by the small-read p99. |
 | `per_stream_mb_s` | The slow-case speed of whole-file downloads, one stream each: 99 of 100 downloads were faster. |
 | `upload_per_stream_mb_s` | The slow-case speed of uploads, one stream each: 99 of 100 uploads were faster. |
@@ -329,6 +330,14 @@ Every value describes the slow case, because the report compares the p99 of each
 ```bash
 byoc-s3 report --run-dir reports/aws-profile-run --reference config/reference_profiles/aws-s3-ec2-same-region.yaml
 ```
+
+That check is not enough on its own: a run always agrees with figures made from itself. Before you commit the profile, record one independent AWS run, from the same instance type and region, at another time of day. Grade it against the new profile. It must pass:
+
+```bash
+byoc-s3 validate --flavor aws --tier 1TB --duration-min 30 --runner-location "ec2 c7i.2xlarge us-east-1" --run-dir reports/aws-control-run --reference config/reference_profiles/aws-s3-ec2-same-region.yaml
+```
+
+If that run fails, the tool is wrong, not AWS S3. Do not commit the profile. Report the failure, with its report.
 
 ## Run the steps one by one
 

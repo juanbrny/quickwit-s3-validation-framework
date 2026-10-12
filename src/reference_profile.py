@@ -45,6 +45,11 @@ UPLOAD_OPS = ("put_object", "multipart_upload")
 # One request that deletes many keys, and one request per key.
 BULK_DELETE_OPS = ("delete_objects_bulk",)
 LOOP_DELETE_OPS = ("delete_object_loop",)
+# The first read of a file just after its upload. On AWS S3 it is slower than
+# other small reads: from an EC2 instance in us-east-1, footer reads had a p99
+# of 122 ms, and the other small reads 65 ms. Graded as small reads, AWS S3
+# passed with only 8% to spare.
+FOOTER_OPS = ("get_footer",)
 
 
 def available_profiles():
@@ -69,6 +74,7 @@ def load_profile(name=DEFAULT_PROFILE):
         ("latency", "first_byte_p99_s", True),
         ("latency", "fanout_tail_factor", True),
         ("latency", "delete_p99_s", False),
+        ("latency", "footer_p99_s", False),
         ("throughput", "per_stream_mb_s", True),
     ):
         value = profile.get(section, {}).get(field)
@@ -96,6 +102,9 @@ def reference_p99(profile, op, median_bytes, keys_per_delete=10):
         return delete
     if op in LOOP_DELETE_OPS:
         return delete * max(1, keys_per_delete)
+    if op in FOOTER_OPS:
+        # A profile from before footer_p99_s grades footers as small reads.
+        latency = profile["latency"].get("footer_p99_s", latency)
     if op in FANOUT_OPS:
         # A query completes when its slowest concurrent read returns. The p99
         # of that maximum sits above the p99 of a single read.
@@ -147,6 +156,8 @@ def describe(profile):
 # it for:
 #
 #   first_byte_p99_s       p99 of the small reads (2 KiB and 8 KiB)
+#   footer_p99_s           p99 of the split footer reads, the first read of a
+#                          file just after its upload
 #   fanout_tail_factor     search p99 / small-read p99
 #   per_stream_mb_s        slow-case speed of whole-file downloads, one stream
 #                          each: 99 of 100 downloads were faster
@@ -158,9 +169,10 @@ def describe(profile):
 # median small-read latency, which is the typical time to the first byte.
 
 SMALL_READS = ("get_term_or_field", "get_doc")
+FOOTER_READS = FOOTER_OPS
 DOWNLOADS = ("get_object_full",)
-MIN_SAMPLES = {"small reads": 100, "searches": 100, "downloads": 100, "uploads": 100,
-               "deletes": 100}
+MIN_SAMPLES = {"small reads": 100, "footer reads": 100, "searches": 100,
+               "downloads": 100, "uploads": 100, "deletes": 100}
 # The speed that 99 of 100 transfers beat. The report compares a measured p99
 # with a reference p99, so the reference must describe the slow case too. The
 # median speed did not: from an EC2 instance in the region, the median merge
@@ -231,6 +243,7 @@ def derive_profile(run_dir):
         warnings.append(f"{failed} of {len(rows)} requests failed; AWS S3 rarely fails.")
 
     small = [r["latency_s"] for r in ok if r["op"] in SMALL_READS]
+    footers = [r["latency_s"] for r in ok if r["op"] in FOOTER_READS]
     searches = [r["latency_s"] for r in ok if r["op"] == "query_wall_clock"]
     part = 5 * 1024 ** 3
     small_p50 = _percentile(small, 50) if small else 0.0
@@ -260,7 +273,7 @@ def derive_profile(run_dir):
         r for r in ok
         if r["op"] in UPLOAD_OPS and large(r) and r["bytes"] <= part  # one stream
     ]
-    counts = {"small reads": len(small), "searches": len(searches),
+    counts = {"small reads": len(small), "footer reads": len(footers), "searches": len(searches),
               "downloads": len(downloads), "uploads": len(uploads), "deletes": len(deletes)}
     for name, need in MIN_SAMPLES.items():
         if counts[name] < need:
@@ -322,6 +335,7 @@ def derive_profile(run_dir):
 
     values = {
         "first_byte_p99_s": round(first_byte_p99, 4),
+        "footer_p99_s": round(_percentile(footers, 99), 4),
         "fanout_tail_factor": round(_percentile(searches, 99) / first_byte_p99, 2),
         "per_stream_mb_s": round(speed(downloads), 1),
         "upload_per_stream_mb_s": round(speed(uploads), 1),
@@ -365,6 +379,7 @@ context:
   source: Measured with this tool, then derived with run_validation.py profile.
   samples:
     small_reads: {small_reads}
+    footer_reads: {footer_reads}
     searches: {searches}
     downloads: {downloads}
     uploads: {uploads}
@@ -377,6 +392,10 @@ latency:
   # The 99th percentile (p99) of the {small_reads} small reads (2 KiB and 8 KiB).
   # The median was {small_read_p50_ms} ms.
   first_byte_p99_s: {first_byte_p99_s}
+
+  # The p99 of {footer_reads} split footer reads: the first read of a file
+  # just after its upload. S3 answers it more slowly than other small reads.
+  footer_p99_s: {footer_p99_s}
 
   # A search ends when its slowest read returns. Measured as the p99 of
   # {searches} searches, divided by the small-read p99.
@@ -410,6 +429,7 @@ def render_profile(values, profile_id=DEFAULT_PROFILE, version=1):
         version=version,
         small_read_p50_ms=round(values["small_read_p50_s"] * 1000),
         small_reads=values["counts"]["small reads"],
+        footer_reads=values["counts"]["footer reads"],
         searches=values["counts"]["searches"],
         downloads=values["counts"]["downloads"],
         uploads=values["counts"]["uploads"],

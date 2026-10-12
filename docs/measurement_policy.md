@@ -71,7 +71,7 @@ The first step of `validate`, and the `check-machine` command, record what the t
 | Open files | The highest open-file limit the process can set | At least what the workload can need at its busiest |
 | Network round trip | The fastest of 20 new TCP (Transmission Control Protocol) connections to the endpoint | At most `max_round_trip_ms`, 10 ms |
 
-A TCP connection opens in one network round trip, and the storage software takes no part in it. So the fastest connection is the network's share of every request. A same-region EC2 (Amazon Elastic Compute Cloud) instance is about 1 ms from AWS S3, and the AWS figures come from there. At 10 ms, the network alone can use a third of the margin of a small read: its limit is 85 ms above the AWS figure, and a new HTTPS connection waits two or three round trips. `1PB` and `10PB` have no entry, because no single machine can send them. Network bandwidth is not measured.
+A TCP connection opens in one network round trip, and the storage software takes no part in it. So the fastest connection is the network's share of every request. A same-region EC2 (Amazon Elastic Compute Cloud) instance is about 1 ms from AWS S3, and the AWS figures come from there. At 10 ms, the network alone can use up to half the margin of a small read: its limit is 65 ms above the AWS figure, and a new HTTPS connection waits two or three round trips. `1PB` and `10PB` have no entry, because no single machine can send them. Network bandwidth is not measured.
 
 The two checks are information only. A machine that misses a rule reads INCONCLUSIVE in "Can we trust this result?", and the report adds a note at the top. No other result changes.
 
@@ -184,11 +184,13 @@ reference  = first_byte_p99_s + bytes / throughput
 limit      = reference x the operation's multiplier
 ```
 
-Two numbers therefore cover every read and upload at every tier, including tiers nobody has measured. A small read costs one round trip. An 8 GB mature split read costs about 91 seconds, where the round trip is a tenth of a percent.
+A few numbers therefore cover every read and upload at every tier, including tiers nobody has measured. A small read costs one round trip. An 8 GB mature split read costs about 200 seconds at the slow-case speed of 41 MiB/s, where the round trip is a small fraction of a percent.
 
 Queries are the exception. A query finishes when the slowest of its concurrent reads returns, and the 99th percentile of that maximum sits above the 99th percentile of one read. `latency.fanout_tail_factor` covers the difference. In a provisional profile it is an assumption. In a profile written by `run_validation.py profile` it is measured: the p99 of whole searches, divided by the p99 of small reads.
 
 Deletes are the other exception. A delete moves no bytes, but S3 updates its index for every key, so it is slower than a small read. A bulk delete uses `latency.delete_p99_s` as its reference. A flavor without bulk delete sends one request per key, so its reference is `delete_p99_s` times the number of keys in one merge, `merge_factor`. Version 1 of the bundled profile graded deletes as small reads, and AWS S3 itself failed: its bulk deletes of 10 keys took about 300 ms, against a limit of 255 ms. A profile without `delete_p99_s` still grades deletes as small reads.
+
+Split footer reads are the third exception. A footer read is the first read of a file just after its upload, and S3 answers it more slowly than other small reads. From an EC2 instance in us-east-1, footer reads had a p99 of 122 ms, and the other small reads 65 ms. Graded as small reads, AWS S3 passed with only 8% to spare, so an independent run could fail by chance. A footer read therefore uses `latency.footer_p99_s` in place of `first_byte_p99_s`. A profile without it grades footers as small reads.
 
 A run graded against a profile made from that same run must pass. `tests/test_reference_profile.py` checks this with slow transfers in the sample, and checks that the median rate fails it.
 

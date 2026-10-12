@@ -116,10 +116,10 @@ What the operation names mean in BYOC:
 
 The run details name a **latency reference**. It is one of two things:
 
-- **A reference profile.** Published AWS S3 figures that ship with the tool. You need no AWS account. This is the default.
+- **A reference profile.** AWS S3 figures that ship with the tool, measured with this tool from an EC2 (Amazon Elastic Compute Cloud) instance in the same region as the bucket. You need no AWS account. This is the default.
 - **A measured AWS run.** You ran the same test against AWS S3 yourself. This is stronger evidence, because it used your machine and your network.
 
-A published profile cannot know how far your machine is from your storage. If your machine is far away, your times include that distance, and the AWS figures do not. A measured AWS run removes that difference.
+The profile's machine was about 1 ms from AWS S3. If your machine is far from your storage, your times include that distance, and the AWS figures do not. The report measures the distance before the run, and shows it as "Network distance to the storage".
 
 ### Over time
 

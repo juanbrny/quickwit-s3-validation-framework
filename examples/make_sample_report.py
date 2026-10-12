@@ -112,7 +112,7 @@ def make_bundle(path, aws=False):
                 0.9 + 0.2 * (i % 20) / 19
             )
             if not aws:
-                latency *= 2.8 if op == "query_wall_clock" else 1.35
+                latency *= 4.8 if op == "query_wall_clock" else 1.35
             worker = (
                 "indexer-0"
                 if op == "put_object"

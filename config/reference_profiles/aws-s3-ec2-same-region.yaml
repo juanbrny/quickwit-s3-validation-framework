@@ -1,67 +1,68 @@
 # Bundled AWS S3 reference profile.
 #
-# A vendor does not need an Amazon Web Services (AWS) account to get a verdict.
-# This file is the bar the framework grades against when no measured baseline
-# is supplied. We publish it because we define what "as fast as AWS S3" means
-# for Quickwit, and we grade ourselves against the same numbers.
-#
-# A measured baseline always wins when the operator supplies one. See
-# docs/measurement_policy.md.
+# A vendor does not need an Amazon Web Services (AWS) account to get a result.
+# This file is the bar the tool grades against when no measured baseline is
+# supplied. It was written by `run_validation.py profile` from a run recorded
+# with this tool. To refresh it, record a new run and run that command again.
 
 id: aws-s3-ec2-same-region
-version: 2
-status: provisional
+version: 3
+status: published
 title: AWS S3 Standard, read from an EC2 instance in the same region
 
 context:
   storage_class: S3 Standard
-  runner: EC2 instance in the same region as the bucket
-  # Replace this block with your own recorded run, then set status: published
-  # and raise the version. The structure does not change.
-  source: >-
-    Published AWS figures, not yet a run recorded with this framework.
+  runner: "ec2 m5a.8xlarge us-east-1"
+  region: us-east-1
+  measured_at: "2026-10-12T09:48:20+00:00"
+  run_id: 9325c7ec1a4b46aaa2fa3a5035f7b10b
+  tool_commit: "eeaec42583e59ae39ee00eb2de1096f23d330c16"
+  tier: 10TB
+  duration_min: 90.0
+  source: Measured with this tool, then derived with run_validation.py profile.
+  samples:
+    small_reads: 11167079
+    footer_reads: 5505
+    searches: 215865
+    downloads: 1227
+    uploads: 1380
+    deletes: 112
   references:
-    - "AWS S3 performance guidance. First-byte-out latency of roughly 100-200
-       ms for the general case."
-    - "AWS S3 best practices whitepaper. Make one concurrent request for each
-       85-90 MB/s of desired network throughput."
-    - "dvassallo/s3-benchmark, 155 instance types. The 90th percentile time to
-       first byte is around 20 ms from an in-region EC2 instance, and one
-       thread moves about 93 MB/s."
+    - "AWS S3 best practices whitepaper. Make one concurrent request for each 85-90 MB/s of desired network throughput."
+    - "dvassallo/s3-benchmark, 155 instance types. The 90th percentile time to first byte is around 20 ms from an in-region EC2 instance, and one thread moves about 93 MB/s."
 
 latency:
-  # The 99th percentile (p99) of a small operation, measured in region. The
-  # framework compares p99 to p99, so this value is a tail figure, not a
-  # median. In region the median first byte is tens of milliseconds; the tail
-  # is what this number describes.
-  first_byte_p99_s: 0.085
+  # The 99th percentile (p99) of the 11167079 small reads (2 KiB and 8 KiB).
+  # The median was 26 ms.
+  first_byte_p99_s: 0.0652
 
-  # A query issues many range reads at once and completes when the slowest one
-  # returns. The p99 of that maximum is worse than the p99 of one read. This
-  # factor covers the difference. It is an assumption, not a measurement.
-  fanout_tail_factor: 2.0
+  # The p99 of 5505 split footer reads: the first read of a file just after
+  # its upload. S3 answers it more slowly than other small reads. This value
+  # comes from the same run's report (122.20 ms), which uses the same
+  # percentile as the profile command. The tool version that wrote this file
+  # did not measure it yet.
+  footer_p99_s: 0.1222
 
-  # The p99 of one delete request. A delete moves no bytes, but S3 updates
-  # its index for every key, so it is slower than a small read. Version 1
-  # graded deletes as small reads, and AWS S3 itself failed: from an
-  # m5a.8xlarge in us-east-1, bulk deletes of 10 keys took about 300 ms,
-  # against a limit of 255 ms. This value is the slowest of those 4 deletes,
-  # until a measured profile replaces it.
-  delete_p99_s: 0.30
+  # A search ends when its slowest read returns. Measured as the p99 of
+  # 215865 searches, divided by the small-read p99.
+  fanout_tail_factor: 4.09
+
+  # The p99 of 112 delete requests: the merges' bulk deletes. A delete moves no
+  # bytes, but S3 updates its index for every key, so it is slower than a
+  # small read.
+  delete_p99_s: 0.4547
 
 throughput:
-  # One request, one stream. AWS tells applications to open one concurrent
-  # request for each 85-90 MB/s they want. That is a typical speed, but the
-  # report compares p99 with p99, so this value should be the slow case: the
-  # speed 99 of 100 transfers beat. From an m5a.8xlarge in us-east-1, the
-  # slowest 1% of 189 MiB merge reads moved at about 42 MiB/s, and AWS S3
-  # failed against 90. A measured profile replaces this value.
-  per_stream_mb_s: 90.0
+  # The slow-case speed of 1227 whole-file downloads, one stream each,
+  # in MiB/s: 99 of 100 were faster. Limits compare p99 with p99, so the
+  # speed must describe the slow case, not the typical one.
+  per_stream_mb_s: 41.3
 
-  # Quickwit uploads above 128 MiB as multipart, with a 5 GiB target part size
-  # (quickwit-storage/src/object_storage/policy.rs). Parts upload at the same
-  # time, so a large upload is faster than one stream. An 8 GB mature split is
-  # two parts, and moves at roughly twice the single-stream rate.
+  # The slow-case speed of 1380 single-stream uploads, in MiB/s.
+  upload_per_stream_mb_s: 64.8
+
+  # BYOC uploads above 128 MiB as multipart, with a 5 GiB target part size,
+  # and sends the parts at the same time.
   multipart_threshold_mb: 128
   multipart_part_gb: 5
   max_concurrent_parts: 10

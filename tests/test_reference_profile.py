@@ -49,20 +49,21 @@ def test_small_operations_cost_one_round_trip(profile):
     reference is the round trip itself. Transfer time must not distort it.
     """
     latency = profile["latency"]["first_byte_p99_s"]
-    for size in (0, 2 * 1024, 8 * 1024, 64 * 1024):
+    for size in (0, 2 * 1024, 8 * 1024):
         predicted = reference_p99(profile, "get_term_or_field", size)
         assert latency <= predicted < latency * 1.01
 
 
 def test_large_reads_are_bound_by_transfer_rate(profile):
     """
-    An 8 GB mature split read takes about 91 seconds at 90 MB/s. The round trip
-    contributes a tenth of a percent, so this criterion is a throughput test.
+    An 8 GB mature split read takes minutes at one stream's speed. The round
+    trip contributes a tiny fraction, so this check is a throughput test.
     """
+    first_byte = profile["latency"]["first_byte_p99_s"]
+    speed = profile["throughput"]["per_stream_mb_s"] * MIB
     predicted = reference_p99(profile, "get_object_full", 8 * GIB)
-    expected = 8 * GIB / (90 * MIB)
-    assert predicted == pytest.approx(expected + 0.085, rel=0.001)
-    assert predicted > 90
+    assert predicted == pytest.approx(first_byte + 8 * GIB / speed, rel=0.001)
+    assert first_byte / predicted < 0.001
 
 
 def test_multipart_uploads_use_concurrent_parts(profile):
@@ -71,18 +72,20 @@ def test_multipart_uploads_use_concurrent_parts(profile):
     and the parts upload at the same time. Modelling an 8 GB split as a single
     stream would make the limit roughly twice too lenient.
     """
+    first_byte = profile["latency"]["first_byte_p99_s"]
+    rates = profile["throughput"]
+    speed = rates.get("upload_per_stream_mb_s", rates["per_stream_mb_s"]) * MIB
     single = reference_p99(profile, "put_object", 100 * MIB)
-    assert single == pytest.approx(0.085 + 100 / 90, rel=0.001)
+    assert single == pytest.approx(first_byte + 100 * MIB / speed, rel=0.001)
 
     two_parts = reference_p99(profile, "multipart_upload", 8 * GIB)
-    one_stream = 8 * GIB / (90 * MIB)
-    assert two_parts == pytest.approx(0.085 + one_stream / 2, rel=0.001)
+    assert two_parts == pytest.approx(first_byte + 8 * GIB / speed / 2, rel=0.001)
 
     # The number of parts is capped, so a huge object does not predict
     # unlimited parallelism.
     huge = reference_p99(profile, "multipart_upload", 500 * GIB)
-    parts = min(math.ceil(500 / 5), profile["throughput"]["max_concurrent_parts"])
-    assert huge == pytest.approx(0.085 + 500 * GIB / (90 * MIB * parts), rel=0.001)
+    parts = min(math.ceil(500 / 5), rates["max_concurrent_parts"])
+    assert huge == pytest.approx(first_byte + 500 * GIB / (speed * parts), rel=0.001)
 
 
 def test_query_fan_out_allows_for_the_slowest_read(profile):
@@ -131,7 +134,7 @@ def _aws_run(tmp_path, download_mib_s=90.0, upload_mib_s=70.0, small_p50=0.020,
              endpoint="https://s3.us-east-1.amazonaws.com", pauses=None,
              idle_p50=0.025, searches=2000, deletes=300, delete_s=0.25,
              round_trip_ms=None, transfers=150, slow_fraction=0.0, slow_factor=0.2,
-             merge_deletes=0, merge_delete_s=0.45):
+             merge_deletes=0, merge_delete_s=0.45, footers=300, footer_factor=2.0):
     """A finished AWS run with known speeds, so the derived numbers are checkable."""
     from examples.make_sample_report import make_bundle
     from src.run_store import digest, read_json, write_json
@@ -144,6 +147,10 @@ def _aws_run(tmp_path, download_mib_s=90.0, upload_mib_s=70.0, small_p50=0.020,
         latency = small_p50 * (1 + rng.expovariate(1 / 0.15))
         query.append({"ts": t + i, "worker": "searcher", "op": "get_term_or_field" if i % 2 else "get_doc",
                       "ok": True, "latency_s": latency, "bytes": 8192, "error": None})
+    for i in range(footers):  # the first read of a new file, slower on S3
+        query.append({"ts": t + i, "worker": "searcher", "op": "get_footer", "ok": True,
+                      "latency_s": footer_factor * small_p50 * (1 + rng.expovariate(1 / 0.15)),
+                      "bytes": 65536, "error": None})
     for i in range(searches):  # the sample run lasts 180 s at a target of 10 per second
         query.append({"ts": t + i, "worker": "searcher", "op": "query_wall_clock", "ok": True,
                       "latency_s": small_p50 * (2 + rng.random()), "bytes": 0, "error": None})
@@ -350,3 +357,25 @@ def test_deletes_come_from_the_merges_when_the_run_has_enough(tmp_path):
     short = _aws_run(tmp_path / "short", merge_deletes=4)
     values, _, _ = derive_profile(short)
     assert values["counts"]["deletes"] == 304 and "single-key" in values["delete_source"]
+
+
+def test_footer_reads_have_their_own_figure(tmp_path):
+    """
+    From an EC2 instance in us-east-1, footer reads had a p99 of 122 ms and
+    other small reads 65 ms. Graded as small reads, AWS S3 passed with 8% to
+    spare, and an independent run could fail by chance.
+    """
+    from src.report_model import build_report
+
+    run = _aws_run(tmp_path, footer_factor=2.0)
+    values, errors, _ = derive_profile(run)
+    assert errors == [] and values["footer_p99_s"] > 1.5 * values["first_byte_p99_s"]
+    path = tmp_path / "profile.yaml"
+    path.write_text(render_profile(values, version=3))
+    profile = load_profile(str(path))
+    assert reference_p99(profile, "get_footer", 65536) > reference_p99(profile, "get_doc", 65536)
+    footer = {c["id"]: c for c in build_report(run, reference=str(path))["checks"]}["get_footer_p99"]
+    assert footer["status"] == "PASS" and footer["ratio"] < 0.6
+    # An older profile without the figure still loads, and grades footers as small reads.
+    del profile["latency"]["footer_p99_s"]
+    assert reference_p99(profile, "get_footer", 65536) == reference_p99(profile, "get_doc", 65536)

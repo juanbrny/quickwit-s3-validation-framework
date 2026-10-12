@@ -182,34 +182,166 @@ def load_file_descriptors(config, search_workers=4):
     return 2 * search_workers * largest + 256
 
 
+def engine_file_descriptors(config, op_mix, seconds=2.0):
+    """Open files the load engine can need at the larger tiers.
+
+    The engine starts searches on a schedule, whether or not earlier ones
+    have finished. If the storage slows to `seconds` per search, that many
+    seconds of searches hold their sockets at once. At 100 TB per day that
+    is about 16,000 sockets.
+    """
+    profiles = config["query_profiles"]
+    total = sum(p["weight"] for p in profiles)
+    reads = sum(
+        p["weight"] / total
+        * (3 * (p["num_search_fields"] * p["num_terms"] * 3 + p["fieldnorm_fields"] + 1)
+           + p.get("docs_returned", 0))
+        for p in profiles
+    )
+    return int(op_mix.query_qps * reads * seconds) + 4 * op_mix.num_indexer_nodes + 256
+
+
 def cmd_load(args, run):
     from src.qw_s3_client import QwS3Client, ensure_file_descriptors
-    from src.ingest_merge_sim import run_ingest_merge_sim, SplitKeyRegistry
-    from src.query_sim import run_query_sim
-    from src.consistency_probes import run_consistency_probes
+    from src.load_engine import choose_engine
 
-    # Check before any request, so the run stops in a second instead of
-    # failing part way through a long soak.
-    run.record["file_descriptor_limit"] = ensure_file_descriptors(
-        load_file_descriptors(run.config)
-    )
+    engine, binary = choose_engine(getattr(args, "engine", "auto"), args.tier)
     constants = run.config["model_constants"]
     op_mix = compute_op_mix(args.tier, run.config)
+    # Check before any request, so the run stops in a second instead of
+    # failing part way through a long soak.
+    needed = load_file_descriptors(run.config)
+    if engine == "rust":
+        needed = max(needed, engine_file_descriptors(run.config, op_mix))
+    run.record["file_descriptor_limit"] = ensure_file_descriptors(
+        needed, " or test a smaller tier"
+    )
     cfg = client_config(args, run, constants["s3_max_concurrency_per_node"])
     client = QwS3Client(cfg)
     client.ensure_bucket(args.bucket)
     run.record["op_mix"] = dataclasses.asdict(op_mix)
-    registry, stop = SplitKeyRegistry(), threading.Event()
+    run.record["engine"] = {"name": engine}
+    stop = threading.Event()
     watch = PauseWatch(stop)
     watch.start()
     prefix = f"qwcert/{run.manifest['run_id']}/{args.tier}"
-    threads, sinks, probe_errors = [], [], []
+    probe_errors = []
     start = time.time()
     run.record["measurement_started_epoch"] = start
     run.save()
     print(
-        f"Running {args.tier} for {args.duration_min:g} minutes, flavor {args.flavor}."
+        f"Running {args.tier} for {args.duration_min:g} minutes, flavor {args.flavor},"
+        f" {engine} load engine."
     )
+
+    def probes():
+        from src.consistency_probes import run_consistency_probes
+
+        try:
+            run_consistency_probes(
+                client,
+                args.bucket,
+                prefix,
+                args.duration_min,
+                interval_s=5,
+                deadline_s=run.config["pass_fail_bands"]["consistency_probe_deadline_s"],
+                out_path=run.path / "consistency.jsonl",
+                stop_event=stop,
+            )
+        except Exception as error:
+            probe_errors.append(
+                {"worker": "probes", "type": type(error).__name__, "message": str(error)}
+            )
+            stop.set()
+
+    prober = threading.Thread(target=probes, daemon=True)
+    try:
+        if engine == "rust":
+            failures = run_rust_load(args, run, cfg, op_mix, constants, prefix, binary,
+                                     stop, prober, probe_errors)
+        else:
+            failures = run_python_load(args, run, client, op_mix, constants, prefix,
+                                       stop, prober, probe_errors)
+        if failures:
+            failures = [redact(f, args) for f in failures]
+            run.record["worker_errors"] = failures
+            run.save()
+            first = failures[0]
+            raise RuntimeError(
+                f"The {first['worker']} worker stopped: {first['type']}: "
+                f"{first['message'][:300]}. The run is incomplete; its"
+                " measurements so far are kept, and the cause is saved in"
+                " manifest.json under worker_errors."
+            )
+    finally:
+        stop.set()
+        if prober.ident:  # it starts only once the workload has started
+            prober.join(timeout=60)
+        start = run.record.get("measurement_started_epoch", start)
+        run.record.setdefault(
+            "measurement_duration_s", min(time.time() - start, args.duration_min * 60)
+        )
+        run.record["pauses"] = watch.pauses
+        run.save()
+        if watch.pauses:
+            total = sum(p["seconds"] for p in watch.pauses)
+            print(
+                f"Warning: this machine stopped running for {total:g} seconds"
+                " during the workload. The report leaves that time out.",
+                file=sys.stderr,
+            )
+
+
+def run_rust_load(args, run, cfg, op_mix, constants, prefix, binary, stop, prober,
+                  probe_errors):
+    """Send the workload with the Rust engine. The visibility checks stay in
+    Python: they send one request every few seconds."""
+    from src.ingest_merge_sim import MERGED_SPLIT_CAP_MIB
+    from src.load_engine import engine_digest, engine_settings, run_engine
+    from src.qw_s3_client import MULTIPART_THRESHOLD_BYTES
+
+    settings = engine_settings(
+        cfg, args.bucket, prefix, op_mix, constants, run.config["query_profiles"],
+        args.duration_min * 60, run.path, MERGED_SPLIT_CAP_MIB * 1024 * 1024,
+        MULTIPART_THRESHOLD_BYTES, int(constants["multipart_part_gb"] * 1024**3),
+    )
+    run.record["engine"].update(binary_sha256=engine_digest(binary))
+
+    def started(event):
+        # The engine's own start time, so the measured windows line up with
+        # its first request.
+        run.record["measurement_started_epoch"] = event["epoch"]
+        run.save()
+        prober.start()
+
+    keep = {}
+    try:
+        summary = run_engine(binary, settings, stop, on_started=started, keep=keep)
+    finally:
+        summary = keep.get("summary")
+        if summary:
+            run.record["measurement_duration_s"] = summary["measurement_duration_s"]
+            run.record["live_splits_at_end"] = summary["live_splits_at_end"]
+            run.record["engine"].update(
+                version=summary.get("engine_version"),
+                searches=summary.get("searches"),
+                machine=summary.get("machine"),
+                stopped_by=summary.get("stopped_by"),
+            )
+            run.save()
+    if prober.ident:
+        prober.join(timeout=60)
+    return probe_errors + summary.get("worker_errors", [])
+
+
+def run_python_load(args, run, client, op_mix, constants, prefix, stop, prober,
+                    probe_errors):
+    """Send the workload from this Python process. Enough for 100GB only."""
+    from src.ingest_merge_sim import run_ingest_merge_sim, SplitKeyRegistry
+    from src.query_sim import run_query_sim
+
+    registry = SplitKeyRegistry()
+    threads, sinks = [], []
     try:
         workers, sink = run_ingest_merge_sim(
             client,
@@ -221,6 +353,7 @@ def cmd_load(args, run):
             registry,
             merge_factor=constants["merge_factor"],
             commit_timeout_s=constants["commit_timeout_s"],
+            gc_grace_s=constants["gc_grace_period_s"],
             stop_event=stop,
             block=False,
         )
@@ -239,44 +372,11 @@ def cmd_load(args, run):
         )
         threads.extend(workers)
         sinks.append(sink)
-
-        def probes():
-            try:
-                run_consistency_probes(
-                    client,
-                    args.bucket,
-                    prefix,
-                    args.duration_min,
-                    interval_s=5,
-                    deadline_s=run.config["pass_fail_bands"][
-                        "consistency_probe_deadline_s"
-                    ],
-                    out_path=run.path / "consistency.jsonl",
-                    stop_event=stop,
-                )
-            except Exception as error:
-                probe_errors.append(
-                    {"worker": "probes", "type": type(error).__name__, "message": str(error)}
-                )
-                stop.set()
-
-        worker = threading.Thread(target=probes, daemon=True)
-        threads.append(worker)
-        worker.start()
+        prober.start()
         for worker in threads:
             worker.join()
-        failures = probe_errors + [e for sink in sinks for e in sink.errors]
-        if failures:
-            failures = [redact(f, args) for f in failures]
-            run.record["worker_errors"] = failures
-            run.save()
-            first = failures[0]
-            raise RuntimeError(
-                f"The {first['worker']} worker stopped: {first['type']}: "
-                f"{first['message'][:300]}. The run is incomplete; its"
-                " measurements so far are kept, and the cause is saved in"
-                " manifest.json under worker_errors."
-            )
+        prober.join()
+        return probe_errors + [e for sink in sinks for e in sink.errors]
     finally:
         stop.set()
         # Let in-flight writes finish before closing their sinks, including on Ctrl-C.
@@ -285,18 +385,10 @@ def cmd_load(args, run):
         for sink in sinks:
             sink.close()
         run.record["measurement_duration_s"] = min(
-            time.time() - start, args.duration_min * 60
+            time.time() - run.record["measurement_started_epoch"], args.duration_min * 60
         )
         run.record["live_splits_at_end"] = len(registry.snapshot())
-        run.record["pauses"] = watch.pauses
         run.save()
-        if watch.pauses:
-            total = sum(p["seconds"] for p in watch.pauses)
-            print(
-                f"Warning: this machine stopped running for {total:g} seconds"
-                " during the workload. The report leaves that time out.",
-                file=sys.stderr,
-            )
 
 
 def keep_awake():
@@ -401,6 +493,14 @@ def cmd_profile(args, parser):
     if errors:
         parser.error(
             "This run cannot give honest reference numbers: " + " ".join(errors)
+        )
+    if not args.out and os.environ.get("BYOC_CONTAINER"):
+        # The bundled profile is inside the image, and would disappear with
+        # the container. Write to a file in the repository instead.
+        raise ValueError(
+            "In the container, pass --out with the profile file to write, for"
+            " example --out config/reference_profiles/" + DEFAULT_PROFILE + ".yaml"
+            " from the repository folder."
         )
     out = Path(args.out or PROFILE_DIR / (DEFAULT_PROFILE + ".yaml"))
     old = yaml.safe_load(out.read_text()) if out.exists() else {}
@@ -654,6 +754,17 @@ def cmd_validate(args, config, parser):
         if not args.aws_endpoint:
             args.aws_endpoint = f"https://s3.{args.aws_region}.amazonaws.com"
         require_connection(parser, args, "aws_", "the AWS S3 baseline")
+    from src.load_engine import choose_engine
+
+    try:
+        engine, _ = choose_engine(args.engine, args.tier)
+    except ValueError as error:
+        parser.error(str(error))
+    if engine == "rust" and args.insecure_skip_tls_verify:
+        parser.error(
+            "The Rust load engine always verifies the endpoint certificate."
+            " Pass --ca-bundle instead of --insecure-skip-tls-verify."
+        )
     if args.run_dir is None:
         args.run_dir = str(default_run_dir())
     steps = 5 + bool(args.with_aws_baseline) + (not args.keep_objects)
@@ -724,7 +835,8 @@ def cmd_validate(args, config, parser):
 
     print(f"\nStep 4 of {steps}: workload soak, {args.tier}")
     load = stage_namespace(
-        args, "load", flavor, tier=args.tier, duration_min=args.duration_min
+        args, "load", flavor, tier=args.tier, duration_min=args.duration_min,
+        engine=args.engine,
     )
     load.func = cmd_load
     failure = None
@@ -755,6 +867,7 @@ def cmd_validate(args, config, parser):
             flavor="aws",
             tier=args.tier,
             duration_min=args.duration_min,
+            engine=args.engine,
             func=cmd_load,
         )
         print(f"Reference directory: {baseline}")
@@ -861,13 +974,26 @@ def add_report_options(parser):
     )
 
 
+ENGINE_HELP = (
+    "Which load engine sends the workload. rust uses every core and the same"
+    " S3 library as BYOC; build it once with `cargo build --release"
+    " --manifest-path loadgen/Cargo.toml`. python needs no build, but one"
+    " process can only send the 100GB tier. auto (default) uses rust when it"
+    " is built, and python for 100GB otherwise."
+)
+
+
 def build_parser():
     # Imported here, not at module level, so the flavor list has one source
     # of truth while the other commands keep loading boto3 only when needed.
     from src.qw_s3_client import FLAVOR_PRESETS
 
+    container = bool(os.environ.get("BYOC_CONTAINER"))
     parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+        prog="byoc-s3" if container else None,
+        description=__doc__.replace("python run_validation.py", "byoc-s3")
+        if container else __doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
 
@@ -924,6 +1050,9 @@ def build_parser():
         "--baseline-run-dir", help="Where to write the AWS baseline bundle."
     )
     one_shot.add_argument("--confirm-extreme-cost", action="store_true")
+    one_shot.add_argument(
+        "--engine", default="auto", choices=["auto", "rust", "python"], help=ENGINE_HELP
+    )
     one_shot.add_argument(
         "--keep-objects",
         action="store_true",
@@ -991,6 +1120,10 @@ def build_parser():
                 help="Soak length in minutes. Use 1 for a first smoke run.",
             )
             p.add_argument("--confirm-extreme-cost", action="store_true")
+            p.add_argument(
+                "--engine", default="auto", choices=["auto", "rust", "python"],
+                help=ENGINE_HELP,
+            )
             p.set_defaults(func=cmd_load)
 
     p = sub.add_parser(
@@ -1078,7 +1211,8 @@ def main(argv=None):
         if args.cmd == "validate":
             return cmd_validate(args, config, parser)
         path = run_stage(args, config)
-        print(f"\nGenerate the report: python run_validation.py report --run-dir {path}")
+        tool = "byoc-s3" if os.environ.get("BYOC_CONTAINER") else "python run_validation.py"
+        print(f"\nGenerate the report: {tool} report --run-dir {path}")
         return 0
     except (ValueError, OSError, KeyError) as error:
         parser.error(str(error))

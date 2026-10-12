@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from collections import Counter
 from pathlib import Path
@@ -161,6 +162,57 @@ TIME_BASED = {
 }
 
 
+# The Rust engine counts how late it started each search. A search more than
+# 100 ms late means the test machine could not keep up with its own schedule.
+LATE_SEARCH_MAX_FRACTION = 0.01
+BUSY_CORES_MAX_FRACTION = 0.8
+
+
+def machine_limit(load):
+    """A note when the test machine, not the storage, may have set the pace.
+
+    In one AWS run at the 1TB tier, the Python engine made every small read
+    take 71 ms instead of 30, and reached 5.7 of 10 searches per second. The
+    storage was blamed for both.
+    """
+    if not load.get("status"):
+        return None
+    engine = load.get("engine") or {"name": "python"}
+    tier = load.get("options", {}).get("tier")
+    if engine.get("name") != "rust":
+        if tier in (None, "100GB"):
+            return None
+        return {
+            "title": "The Python load engine sent this workload",
+            "detail": f"One Python process cannot send the {tier} workload at full"
+            " speed. It slows every request, so response times and the search"
+            " rate may describe the test machine, not the storage. Run it again"
+            " with the Rust load engine.",
+        }
+    searches = engine.get("searches") or {}
+    machine = engine.get("machine") or {}
+    started = searches.get("started") or 0
+    late = searches.get("late_over_100ms") or 0
+    cores = machine.get("cores") or 0
+    used = machine.get("average_cores_used") or 0
+    reasons = []
+    if started and late / started > LATE_SEARCH_MAX_FRACTION:
+        reasons.append(
+            f"{late} of {started} searches started more than 100 ms late"
+        )
+    if cores and used / cores > BUSY_CORES_MAX_FRACTION:
+        reasons.append(f"the engine used {used:.1f} of {cores} cores on average")
+    if not reasons:
+        return None
+    return {
+        "title": "The test machine was near its limit",
+        "detail": "During the workload, " + " and ".join(reasons) + ". Response"
+        " times and the search rate may then describe the test machine, not the"
+        " storage. Use a machine from the recommendations in"
+        " docs/run_a_validation.md, or a smaller tier.",
+    }
+
+
 def paused_time(stage):
     """Seconds this machine was not running during one stage.
 
@@ -318,12 +370,55 @@ def _number(value):
     )
 
 
+class Row:
+    """One measured request, with fixed fields.
+
+    A 30-minute run at the 100TB tier records about 14 million requests. As
+    dictionaries they would need about 16 GB of memory in the report. With
+    fixed fields and shared strings, they need about 3.5 GB.
+    """
+
+    __slots__ = ("ts", "worker", "op", "ok", "latency_s", "bytes", "error")
+
+    def __getitem__(self, name):
+        try:
+            return getattr(self, name)
+        except AttributeError:
+            raise KeyError(name) from None
+
+    def get(self, name, default=None):
+        value = getattr(self, name, default)
+        return default if value is None and name != "error" else value
+
+
+def _compact(raw, strings, numbers):
+    row = Row()
+    row.ts = raw.get("ts")
+    row.latency_s = raw.get("latency_s")
+    row.ok = raw.get("ok")
+    value = raw.get("bytes", 0)
+    row.bytes = numbers.setdefault(value, value) if isinstance(value, int) else value
+    for name in ("worker", "op", "error"):
+        value = raw.get(name)
+        setattr(row, name, strings.setdefault(value, value) if isinstance(value, str) else value)
+    return row
+
+
 def _rows(path):
-    rows = _load_jsonl(path)
+    if not path.exists():
+        return []
+    rows, strings, numbers = [], {}, {}
+    with open(path) as f:
+        for i, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            raw = json.loads(line)
+            if not isinstance(raw, dict):
+                raise ValueError(f"Invalid measurement in {path.name}, line {i}")
+            rows.append(_compact(raw, strings, numbers))
     for i, row in enumerate(rows, 1):
         if (
-            not isinstance(row, dict)
-            or not isinstance(row.get("op"), str)
+            not isinstance(row.get("op"), str)
             or type(row.get("ok")) is not bool
             or not _number(row.get("latency_s"))
             or row["latency_s"] < 0
@@ -402,6 +497,8 @@ def _baseline(path, manifest, load):
             issues.append(f"Baseline {name} differs.")
     if bl.get("op_mix") != load.get("op_mix"):
         issues.append("Baseline modeled workload differs.")
+    if bl.get("engine", {}).get("name", "python") != load.get("engine", {}).get("name", "python"):
+        issues.append("Baseline load engine differs.")
     for name in (
         "source_sha256",
         "python",
@@ -1256,6 +1353,9 @@ def build_report(
                 " systems, make sure the machine cannot sleep.",
             },
         )
+    limit = machine_limit(load)
+    if limit:
+        headline_limits.insert(0, limit)
     # A short run leaves checks unanswered for reasons that are arithmetic, not
     # faults. Say so first, in numbers, so nobody hunts for a problem.
     if load.get("status") == "COMPLETED":

@@ -50,6 +50,25 @@ Runs recorded before pauses were tracked only show the total pause, not when it 
 
 On a Mac, the tool runs `caffeinate` for as long as the run lasts, which stops idle sleep.
 
+## When the test machine is the limit
+
+The load engine starts each search on a fixed schedule. It records how late each search started, and how much processor time it used. The report names the test machine as a possible limit when either is true:
+
+- more than 1% of searches started more than 100 ms late;
+- the engine used more than 80% of the machine's cores on average.
+
+A run of a tier above `100GB` with the Python engine gets the same note, because one Python process cannot send those workloads at full speed. The note changes no result. It tells the reader that response times and the search rate may describe the test machine.
+
+## The workload
+
+Both load engines follow these rules. The numbers come from `config/tiers.yaml`.
+
+- **Indexers.** Each indexer uploads one split every `commit_timeout_s` (60 seconds). The indexers start spread evenly over that interval, as real indexers are not synchronized.
+- **Merges.** When an indexer has uploaded `merge_factor` (10) splits, a merge starts in its own task, so it never delays the next upload. It reads each input in full, then uploads one merged split, capped at 160 MiB.
+- **Publish and delete.** The merged split replaces its inputs for every new search, in one step. The inputs are deleted `gc_grace_period_s` (60 seconds) later, so searches that already chose them can finish. BYOC waits longer; one minute keeps the deletes inside a 30-minute run.
+- **Searches.** Searches start on a fixed schedule at the tier's rate, whether or not earlier searches have finished, the way user queries arrive. All reads of one search go out at the same time. If more than 30 seconds of searches are still running, new searches are counted as skipped instead of piling up.
+- **Client.** Each request is tried at most 3 times, in the S3 library's standard retry mode. A connection must open within 10 seconds, and a response must start within 60 seconds.
+
 ## Evidence policy
 
 Stages are write-once. A lock prevents two commands from modifying one manifest at the same time. A crash may leave a `.running` file; start a fresh experiment rather than appending to interrupted measurements. Reports can still inspect partial bundles.

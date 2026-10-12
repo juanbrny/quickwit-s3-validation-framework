@@ -44,9 +44,14 @@ def digest(path):
 
 
 def default_run_dir():
-    """A unique bundle directory, used when the caller gives no --run-dir."""
+    """A unique bundle directory, used when the caller gives no --run-dir.
+
+    In the container, the tool lives in /app, which disappears with the
+    container. The wrapper sets BYOC_REPORTS_DIR to a folder on the host.
+    """
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return ROOT / "reports" / (stamp + "-" + uuid.uuid4().hex[:8])
+    base = Path(os.environ.get("BYOC_REPORTS_DIR") or ROOT / "reports")
+    return base / (stamp + "-" + uuid.uuid4().hex[:8])
 
 
 def provenance():
@@ -78,13 +83,28 @@ def provenance():
         except (OSError, ValueError, subprocess.CalledProcessError):
             pass
     # Include source fingerprints even for uncommitted or downloaded code.
-    source_files = [ROOT / "run_validation.py", *sorted((ROOT / "src").glob("*.py"))]
+    # The Rust load engine sends the workload, so its sources count too.
+    engine = ROOT / "loadgen"
+    source_files = [
+        ROOT / "run_validation.py",
+        *sorted((ROOT / "src").glob("*.py")),
+        *[p for p in (engine / "Cargo.toml", engine / "Cargo.lock") if p.exists()],
+        *sorted((engine / "src").glob("*.rs")),
+    ]
     source_hash = hashlib.sha256(
         "".join(digest(p) for p in source_files).encode()
     ).hexdigest()
+    # The container has no git. Its build records the commit instead, and
+    # source_sha256 still shows whether the files changed.
+    commit = git("rev-parse", "HEAD")
+    if commit == "unavailable" and os.environ.get("BYOC_SOURCE_COMMIT"):
+        recorded_commit, dirty = os.environ["BYOC_SOURCE_COMMIT"], False
+    else:
+        recorded_commit, dirty = commit, bool(git("status", "--porcelain"))
     return {
-        "commit": git("rev-parse", "HEAD"),
-        "dirty": bool(git("status", "--porcelain")),
+        "commit": recorded_commit,
+        "dirty": dirty,
+        "container_image": os.environ.get("BYOC_IMAGE"),
         "source_sha256": source_hash,
         "python": platform.python_version(),
         "os": platform.platform(),

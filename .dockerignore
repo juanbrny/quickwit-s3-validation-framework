@@ -1,0 +1,10 @@
+.git
+venv
+reports
+loadgen/target
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.env
+*.env
+tests

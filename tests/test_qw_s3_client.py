@@ -299,3 +299,24 @@ def test_the_workload_step_asks_for_enough_open_files():
     from src.workload_model import load_config
 
     assert load_file_descriptors(load_config()) >= 4 * 155 + 256
+
+
+@pytest.mark.parametrize("endpoint,path_style,expected", [
+    ("https://s3.example.com", False, "virtual"),
+    ("http://host.docker.internal:9000", False, "virtual"),
+    ("http://10.0.0.5:9000", False, "path"),
+    ("http://[::1]:9000", False, "path"),
+    (None, False, "virtual"),
+    ("https://s3.example.com", True, "path"),
+])
+def test_buckets_are_addressed_the_way_byoc_addresses_them(endpoint, path_style, expected):
+    """
+    boto3's "auto" style used paths for every custom endpoint, while BYOC's
+    S3 library puts the bucket in the host name. The compatibility check then
+    passed BYOC's defaults on an endpoint where BYOC itself would fail.
+    """
+    from src.qw_s3_client import addressing_style
+
+    cfg = QwS3Config.from_flavor("none", endpoint, "a", "b")
+    cfg.force_path_style = path_style
+    assert addressing_style(cfg) == expected

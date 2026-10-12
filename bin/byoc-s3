@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# byoc-s3: run the Datadog BYOC Logs S3 storage validation in a container.
+#
+#   byoc-s3 validate --tier 1TB --duration-min 30
+#
+# Every argument goes to the tool unchanged. The wrapper only sets up the
+# container:
+#
+# - the current directory is mounted at the same path, so `--run-dir` and
+#   other relative paths work, and results land on this machine;
+# - connection settings pass by name from your environment, so secrets never
+#   appear on a command line;
+# - a `--ca-bundle` file outside the current directory is mounted read-only;
+# - the container runs as your user, so you own the results;
+# - on Linux it uses the host network, which matters at 100 TB per day;
+# - on macOS it keeps the machine awake for as long as the run lasts.
+#
+# Settings: BYOC_S3_IMAGE (image to run), BYOC_S3_RUNTIME (docker or podman).
+set -euo pipefail
+
+DEFAULT_IMAGE="byoc-s3-validation:latest"
+IMAGE="${BYOC_S3_IMAGE:-$DEFAULT_IMAGE}"
+
+runtime="${BYOC_S3_RUNTIME:-}"
+if [ -z "$runtime" ]; then
+  if command -v docker >/dev/null 2>&1; then runtime=docker
+  elif command -v podman >/dev/null 2>&1; then runtime=podman
+  else
+    echo "byoc-s3: Docker or Podman is needed to run the validation." >&2
+    exit 127
+  fi
+fi
+
+here="$(pwd -P)"
+options=(run --rm
+  --user "$(id -u):$(id -g)"
+  --volume "$here:$here" --workdir "$here"
+  --env "BYOC_REPORTS_DIR=$here/reports"
+  # Every request in flight holds a socket. 100 TB per day needs about 16,500.
+  --ulimit nofile=65536:65536)
+
+# Interactive terminal: Ctrl-C then reaches the run, which stops cleanly.
+if [ -t 0 ] && [ -t 1 ]; then options+=(--interactive --tty); fi
+
+# Connection settings, passed by name only. The value never shows in `ps`.
+for name in QW_S3_ENDPOINT QW_S3_BUCKET QW_S3_ACCESS_KEY QW_S3_SECRET_KEY \
+            QW_S3_REGION QW_S3_SESSION_TOKEN QW_S3_CA_BUNDLE \
+            QW_AWS_ENDPOINT QW_AWS_BUCKET QW_AWS_ACCESS_KEY QW_AWS_SECRET_KEY \
+            QW_AWS_REGION QW_AWS_SESSION_TOKEN \
+            AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN \
+            AWS_REGION AWS_DEFAULT_REGION AWS_CA_BUNDLE; do
+  if [ -n "${!name:-}" ]; then options+=(--env "$name"); fi
+done
+
+# Local time in the report. macOS does not set TZ, so read it from the system.
+zone="${TZ:-}"
+if [ -z "$zone" ] && [ -L /etc/localtime ]; then
+  zone="$(readlink /etc/localtime | sed 's|.*/zoneinfo/||')"
+fi
+if [ -n "$zone" ]; then options+=(--env "TZ=$zone"); fi
+
+# Mount a certificate bundle that lives outside the current directory.
+mount_file() {
+  case "$1" in
+    /*) if [ -f "$1" ] && [ "${1#"$here"/}" = "$1" ]; then
+          options+=(--volume "$1:$1:ro")
+        fi ;;
+  esac
+}
+previous=""
+for argument in "$@"; do
+  case "$argument" in
+    --ca-bundle=*) mount_file "${argument#--ca-bundle=}" ;;
+  esac
+  if [ "$previous" = "--ca-bundle" ]; then mount_file "$argument"; fi
+  previous="$argument"
+done
+for name in QW_S3_CA_BUNDLE AWS_CA_BUNDLE; do
+  if [ -n "${!name:-}" ]; then mount_file "${!name}"; fi
+done
+
+case "$(uname -s)" in
+  Linux)
+    # The host network avoids the container network's address translation,
+    # which costs processor time at high request rates.
+    options+=(--network host)
+    exec "$runtime" "${options[@]}" "$IMAGE" "$@"
+    ;;
+  Darwin)
+    endpoint="${QW_S3_ENDPOINT:-} $*"
+    case "$endpoint" in
+      *localhost*|*127.0.0.1*)
+        echo "byoc-s3: inside the container, localhost is the container itself." \
+             "Use host.docker.internal to reach this Mac." >&2 ;;
+    esac
+    # A sleeping Mac stops the run. caffeinate ends together with the run.
+    exec caffeinate -i -s "$runtime" "${options[@]}" "$IMAGE" "$@"
+    ;;
+  *)
+    exec "$runtime" "${options[@]}" "$IMAGE" "$@"
+    ;;
+esac

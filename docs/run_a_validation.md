@@ -4,16 +4,65 @@ Every command for running the tool is on this page, and only here. To understand
 
 ## What you need
 
-- Python 3.9 or later.
+- Docker or Podman, on Linux or macOS. The tool runs in a container, for `linux/amd64` and `linux/arm64`. You do not need Python or Rust. To run without a container, see [Run from source](#run-from-source).
+- A test machine big enough for the daily volume you test. See [Choose a test machine](#choose-a-test-machine).
 - A bucket on the storage system you want to test. The run writes and deletes objects under the `qwcert/` prefix.
 - An access key and a secret key that can read, write and delete in that bucket. See [Permissions](#permissions) for the exact list.
 
 You do not need an Amazon Web Services (AWS) account. The tool compares your storage with published AWS S3 figures. If you do have an AWS account, you can measure AWS yourself. See [Compare with your own AWS run](#compare-with-your-own-aws-run).
 
+## Install
+
+You need two things: the container image, and `byoc-s3`, a small script that runs it. Build the image from this repository, then write the script into a folder on your `PATH`:
+
 ```bash
-python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+docker build -t byoc-s3-validation .
+mkdir -p ~/.local/bin
+docker run --rm byoc-s3-validation print-wrapper > ~/.local/bin/byoc-s3
+chmod +x ~/.local/bin/byoc-s3
 ```
+
+If you received a published image name, pull that image instead of building it, and use its name in the second command. The script then runs that image. To run another image later, set `BYOC_S3_IMAGE`. To use Podman when both are installed, set `BYOC_S3_RUNTIME=podman`.
+
+Every command on this page starts with `byoc-s3`. The script passes its arguments to the tool unchanged. It also sets up the container:
+
+- **Results.** It mounts the current folder, so results go to `reports/` in the folder where you run the command. Run it in the same folder every time.
+- **Keys.** It passes the connection settings of [Step 1](#step-1-set-the-connection) from your environment, by name. Their values never appear on a command line.
+- **Certificates.** It mounts a `--ca-bundle` file, even outside the current folder.
+- **Owner.** The container runs as your user, so you own the results.
+- **Network.** On Linux, the container uses the host network. At high request rates, the container network would cost processor time.
+- **Sleep.** On macOS, it keeps the Mac awake for as long as the run lasts.
+
+Inside the container, `localhost` is the container itself. On Linux this does not matter, because of the host network. On macOS, use `host.docker.internal` to reach a storage system that runs on the Mac.
+
+### Choose a test machine
+
+The test machine must send the whole workload without becoming the limit itself. Otherwise the report measures the machine, not the storage. These are the smallest machines we recommend, for a 30-minute run:
+
+| `--tier` | Network, sustained | Cores (vCPUs) | Memory | Free disk | Example on AWS |
+|---|---|---|---|---|---|
+| `100GB` | 1 Gbit/s | 2 | 4 GB | 1 GB | `c7i.large` |
+| `1TB` | 2.5 Gbit/s | 4 | 8 GB | 1 GB | `c7i.xlarge` |
+| `10TB` | 5 Gbit/s | 8 | 16 GB | 4 GB | `c7i.2xlarge` |
+| `100TB` | 25 Gbit/s | 16 | 32 GB | 10 GB | `c6in.4xlarge` |
+
+- **Network, sustained** is the speed the machine keeps for the whole run, not its short peak. Many cloud machines are sold as "up to" a speed, and keep only a fraction of it. Check the baseline figure. On premises, `100TB` needs a 25 Gbit/s network card and path to the storage: a 10 Gbit/s card would be 80% busy on average.
+- **Memory and disk** are mostly for the results. A 30-minute `100TB` run records about 14 million requests, in about 2 GB of files. The report needs about 3.5 GB of memory to read them.
+- **On macOS**, the container runs inside a virtual machine. Its cores and memory are the test machine, so give it at least the values above, in the settings of Docker Desktop or Rancher Desktop. Its network is also slower than the Mac's own. Use Linux for `10TB` and `100TB`.
+- `1PB` and `10PB` need several test machines. Their write traffic alone is 36 Gbit/s on average. The tool does not run one workload from several machines yet.
+
+How the table was sized:
+
+| `--tier` | Average traffic | Requests per second | Main source |
+|---|---|---|---|
+| `100GB` | 12 Mbit/s | about 50 | searches |
+| `1TB` | 0.1 Gbit/s | about 500 | searches |
+| `10TB` | 0.9 Gbit/s | about 2,000 | searches |
+| `100TB` | 8 Gbit/s | about 7,800 | uploads and merges: 2.2 uploads of 196 MB every second |
+
+The engine itself is light. Against a local server that stores nothing, it sent the whole `100TB` workload for 13 minutes, merges and deletes included, with about 1 core busy and 350 MB of memory. No search started late. The recommendations leave room for encryption, the operating system's network work, and the report. A busy machine also delays searches, and the table keeps it well below that point.
+
+The report checks the machine on every run. If searches started late, or the engine kept most cores busy, the report says so at the top. Then the results may describe the test machine, not the storage.
 
 ### Permissions
 
@@ -93,21 +142,21 @@ Temporary keys start with `ASIA`. They only work together with a session token. 
 Run this first, every time. It proves the keys, the bucket and the address all work, before you start a long test.
 
 ```bash
-python run_validation.py validate --tier 100GB --duration-min 1 --levels 1,8,16 --repeats 1
+byoc-s3 validate --tier 100GB --duration-min 1 --levels 1,8,16 --repeats 1
 ```
 
 This is not a real result. One minute collects too few samples. You only check that every step finishes.
 
 ### Keep the machine awake
 
-A long run stops being a test of the storage if the test machine sleeps. On a Mac, the tool keeps the machine awake by itself while a run is going. Keep the lid open, though: closing it can still put a MacBook to sleep. On other systems, make sure the machine cannot sleep or suspend during the run.
+A long run stops being a test of the storage if the test machine sleeps. On a Mac, `byoc-s3` keeps the machine awake by itself while a run is going. Keep the lid open, though: closing it can still put a MacBook to sleep. On other systems, make sure the machine cannot sleep or suspend during the run.
 
 If the machine does stop, the report says so at the top, and leaves that time out of the results.
 
 ## Step 3: the real run
 
 ```bash
-python run_validation.py validate --tier 1TB --duration-min 30
+byoc-s3 validate --tier 1TB --duration-min 30
 ```
 
 `validate` runs five steps, in this order:
@@ -136,7 +185,7 @@ Step 1 tries known sets of settings, from the mildest to the strongest. It stops
 To test the settings you will actually deploy, choose them:
 
 ```bash
-python run_validation.py validate --tier 1TB --duration-min 30 --flavor storagegrid
+byoc-s3 validate --tier 1TB --duration-min 30 --flavor storagegrid
 ```
 
 The tool still tests your choice first. If it fails a compatibility check, the run stops, so it never measures settings that do not work.
@@ -165,7 +214,8 @@ Over plain `http://`, uploads send their checksum in a different way than over `
 | `--keep-objects` | Leave the test objects in the bucket. |
 | `--levels 1,8,16,32` | Test fewer concurrency levels. |
 | `--ca-bundle PATH` | Trust a private certificate authority. On-premises storage usually needs this. |
-| `--insecure-skip-tls-verify` | Skip the certificate check. The report records that you did. |
+| `--insecure-skip-tls-verify` | Skip the certificate check. The report records that you did. Works only with `--engine python`. |
+| `--engine rust` or `--engine python` | Choose the load engine. By default, the load engine when it is built, and Python for `100GB` otherwise. |
 | `--strict` | Exit with status 1 when the result is not PASS. Useful in automated pipelines. |
 
 ## Step 4: read the result
@@ -189,7 +239,7 @@ export QW_AWS_SECRET_KEY=...
 Then add `--with-aws-baseline`:
 
 ```bash
-python run_validation.py validate --tier 1TB --duration-min 30 --with-aws-baseline --runner-location office-laptop
+byoc-s3 validate --tier 1TB --duration-min 30 --with-aws-baseline --runner-location office-laptop
 ```
 
 The tool runs the same test against AWS S3, from the same machine, straight after the first one. `--runner-location` is a free label for where your machine is. Both runs must carry the same label, so give it every time.
@@ -198,9 +248,9 @@ The tool runs the same test against AWS S3, from the same machine, straight afte
 
 Response times are graded against a reference profile of AWS S3, bundled with the tool. To replace its figures with your own measurement, record one run from inside AWS, then let the tool derive the profile from it.
 
-1. **Start an EC2 instance in the same region as an S3 bucket**, for example `us-east-1`. Pick one with high network bandwidth, for example `c5n.2xlarge`. A small instance limits the transfer speed, and the profile would describe the instance instead of S3.
+1. **Start an EC2 instance in the same region as an S3 bucket**, for example `us-east-1`. Pick one with high network bandwidth, for example `c7i.2xlarge`. A small instance limits the transfer speed, and the profile would describe the instance instead of S3.
 
-2. **On the instance, run the full validation against that bucket:**
+2. **On the instance, [install the tool](#install), then run the full validation against that bucket:**
 
 ```bash
 export QW_S3_ENDPOINT=https://s3.us-east-1.amazonaws.com
@@ -209,17 +259,16 @@ export QW_S3_BUCKET=your-aws-bucket
 export QW_S3_ACCESS_KEY=...
 export QW_S3_SECRET_KEY=...
 
-python run_validation.py validate --flavor aws --tier 100GB --duration-min 30 --runner-location "ec2 c5n.2xlarge us-east-1" --run-dir reports/aws-profile-run
+byoc-s3 validate --flavor aws --tier 1TB --duration-min 30 --runner-location "ec2 c7i.2xlarge us-east-1" --run-dir reports/aws-profile-run
 ```
 
-Use the `100GB` tier. At `1TB`, one Python process sends about 300 requests per second, and it slows down every request it sends. The profile would then describe the test machine, not S3.
 
 3. **Copy the run directory back to your own machine**, for example with `scp -r`. Keep it: it is the evidence behind the new figures.
 
-4. **Write the profile from it:**
+4. **In the repository folder, write the profile from it:**
 
 ```bash
-python run_validation.py profile --run-dir reports/aws-profile-run
+byoc-s3 profile --run-dir reports/aws-profile-run --out config/reference_profiles/aws-s3-ec2-same-region.yaml
 ```
 
 The command prints each value before and after, and raises the profile's version. Review the change with `git diff`, then commit it.
@@ -251,16 +300,16 @@ Only transfers of at least 16 MiB count toward a speed. On a smaller transfer, t
 Use this when you need to repeat one step, or run steps from different machines. Give every step the same `--run-dir`.
 
 ```bash
-python run_validation.py compat --run-dir reports/my-test
+byoc-s3 compat --run-dir reports/my-test
 ```
 
 It prints the settings it picked, for example `Recommended flavor: storagegrid`. Use that name in the next steps:
 
 ```bash
-python run_validation.py read-concurrency --run-dir reports/my-test --flavor storagegrid
-python run_validation.py write-concurrency --run-dir reports/my-test --flavor storagegrid
-python run_validation.py load --run-dir reports/my-test --flavor storagegrid --tier 1TB --duration-min 30
-python run_validation.py report --run-dir reports/my-test
+byoc-s3 read-concurrency --run-dir reports/my-test --flavor storagegrid
+byoc-s3 write-concurrency --run-dir reports/my-test --flavor storagegrid
+byoc-s3 load --run-dir reports/my-test --flavor storagegrid --tier 1TB --duration-min 30
+byoc-s3 report --run-dir reports/my-test
 ```
 
 Each step runs once per directory. To repeat a step, use a new directory.
@@ -270,7 +319,7 @@ Older names still work, so existing scripts do not break: `run_certification.py`
 When you have finished with a run, delete its objects:
 
 ```bash
-python run_validation.py cleanup --run-dir reports/my-test
+byoc-s3 cleanup --run-dir reports/my-test
 ```
 
 ## Clean up runs from before this version
@@ -278,7 +327,7 @@ python run_validation.py cleanup --run-dir reports/my-test
 Earlier versions did not delete anything. Give `cleanup` every old run directory at once. It reads the bucket and the address from each run, so you only need the keys:
 
 ```bash
-python run_validation.py cleanup --run-dir reports/run-a --run-dir reports/run-b --old-compat-objects
+byoc-s3 cleanup --run-dir reports/run-a --run-dir reports/run-b --old-compat-objects
 ```
 
 `--old-compat-objects` also removes the compatibility objects that older versions left in a shared `compat/` folder. It removes only names the tool generated, in the buckets those runs used.
@@ -311,7 +360,10 @@ Keep `report-evidence/` next to `report.html`, or the download links break.
 | `InvalidToken` or `ExpiredToken` | Temporary keys need a valid session token. See [Where the keys come from](#where-the-keys-come-from). |
 | `SSLError` or `CERTIFICATE_VERIFY_FAILED` | Pass `--ca-bundle /path/to/ca.pem`. |
 | `No flavor passed every compatibility check` | The tool connected, but no known settings work. Open `compat.md` in the run directory to see which check failed. |
-| `Too many open files`, or `This machine ran out of open files` | A limit of your machine, not of the storage. The tool raises it by itself where it can. If it cannot, run `ulimit -n 4096` and start again. |
+| `The 1TB tier needs the Rust load engine` | Only when you run from source. Build the engine. See [Run from source](#run-from-source). |
+| `Name or service not known`, or no connection to `localhost` | On macOS, use `host.docker.internal` instead of `localhost`. If the storage system has no host name for each bucket, the compatibility step picks settings with path-style addresses. |
+| `The test machine was near its limit` (in the report) | The machine could not keep to the workload's schedule. Use a bigger machine. See [Choose a test machine](#choose-a-test-machine). |
+| `Too many open files`, or `This machine ran out of open files` | A limit of your machine, not of the storage. The tool raises it by itself where it can. If it cannot, run the `ulimit -n` command the message shows, and start again. The `100TB` tier needs about 16,500 open files. |
 | `The ... worker stopped: ...` | The workload stopped early. The message names the real cause. The measurements up to that point are kept, and `validate` still writes the report. |
 | `The test machine stopped for N seconds` (in the report) | The machine slept or was suspended during the run. Run again, and keep it awake. |
 | `Stage ... already exists` | Each step runs once per directory. Use a new `--run-dir`. |
@@ -322,5 +374,41 @@ Keep `report-evidence/` next to `report.html`, or the download links break.
 This writes an example report from made-up numbers. The page says that it is an example.
 
 ```bash
-python examples/make_sample_report.py --out-dir reports/example
+byoc-s3 sample-report --out-dir reports/example
 ```
+
+## Run from source
+
+Use this to change the tool, or where you cannot run containers. You need Python 3.9 or later, and Rust from [rustup.rs](https://rustup.rs) for the load engine.
+
+```bash
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+cargo build --release --manifest-path loadgen/Cargo.toml
+```
+
+Then type `python run_validation.py` wherever this page says `byoc-s3`, for example:
+
+```bash
+python run_validation.py validate --tier 100GB --duration-min 1 --levels 1,8,16 --repeats 1
+```
+
+`byoc-s3 sample-report` becomes `python examples/make_sample_report.py`.
+
+The load engine in `loadgen/` sends the workload. One Python process cannot: it runs on one core at a time, and it slows every request it sends. Build the engine again after you update the tool. If it is not built, only the `100GB` tier runs, with the slower Python engine. Every other tier stops with a message that tells you how to build it.
+
+## Build the image
+
+The image holds Python, its packages, the tool and the load engine. To build it for this machine only:
+
+```bash
+docker build -t byoc-s3-validation .
+```
+
+To publish one image for both `linux/amd64` and `linux/arm64`, build with `buildx` and push it to a registry. Pass the same name as `IMAGE`, so that `print-wrapper` writes a script that runs this image. `SOURCE_COMMIT` goes into every run record, because the image has no git:
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 --build-arg IMAGE=registry.example.com/byoc-s3-validation:1.0 --build-arg SOURCE_COMMIT=$(git rev-parse HEAD) -t registry.example.com/byoc-s3-validation:1.0 --push .
+```
+
+The load engine compiles on the build machine's own architecture for each target, so the build takes a few minutes for each platform.

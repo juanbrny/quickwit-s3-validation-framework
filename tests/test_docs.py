@@ -29,8 +29,13 @@ DOCUMENTED_ENV = {
 }
 
 
+# Commands the container's entry point handles itself, not the tool's parser.
+WRAPPER_ONLY = {"sample-report", "print-wrapper"}
+PREFIXES = ("byoc-s3 ", "python run_validation.py ")
+
+
 def documented_commands(path):
-    """Every `python run_validation.py ...` command in one document."""
+    """Every `byoc-s3 ...` or `python run_validation.py ...` command in one document."""
     text = path.read_text()
     commands = []
     # Consume each fence with its language tag, so a ```text block cannot
@@ -39,7 +44,7 @@ def documented_commands(path):
         joined = block.replace("\\\n", " ")
         for line in joined.splitlines():
             line = line.strip()
-            if line.startswith("python run_validation.py"):
+            if line.startswith(PREFIXES):
                 commands.append(line)
     return commands
 
@@ -51,11 +56,14 @@ def test_the_documents_contain_commands_to_check():
     assert len(ALL) >= 8
 
 
-@pytest.mark.parametrize("doc,command", ALL, ids=[f"{d}:{c[27:60]}" for d, c in ALL])
+@pytest.mark.parametrize("doc,command", ALL, ids=[f"{d}:{c[:60]}" for d, c in ALL])
 def test_every_documented_command_works_as_written(doc, command, monkeypatch):
     for name, value in DOCUMENTED_ENV.items():
         monkeypatch.setenv(name, value)
-    argv = shlex.split(command)[2:]  # drop "python run_validation.py"
+    words = shlex.split(command)
+    argv = words[1:] if words[0] == "byoc-s3" else words[2:]
+    if argv[0] in WRAPPER_ONLY:
+        return
     parser = build_parser()
     args = parser.parse_args(argv)  # a missing or wrong flag exits here
     # `report` reads local files only. `cleanup` takes the endpoint and the
@@ -124,3 +132,15 @@ def test_reader_facing_text_never_says_certified():
                 assert "formal certification" in line or "run_certification" in line, (
                     f"{path.name}: {line.strip()[:100]}"
                 )
+
+
+def test_the_wrapper_passes_every_connection_setting():
+    """A setting the wrapper forgets would silently fall back to another source."""
+    import run_validation
+
+    wrapper = (ROOT / "bin" / "byoc-s3").read_text()
+    names = {n for group in (run_validation.ENV_DEFAULTS, run_validation.AWS_ENV_DEFAULTS)
+             for names in group.values() for n in names}
+    names |= {"QW_S3_CA_BUNDLE", "AWS_CA_BUNDLE"}
+    missing = sorted(n for n in names if n not in wrapper)
+    assert not missing, f"bin/byoc-s3 does not pass {missing}"

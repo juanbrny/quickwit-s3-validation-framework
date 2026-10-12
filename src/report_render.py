@@ -328,6 +328,7 @@ def render_html(report, links=None):
         ("Settings recommended", flavor_label(report["recommended_flavor"])),
         ("Latency reference", _reference_label(report)),
         ("Runner location", load.get("options", {}).get("runner_location")),
+        ("Load engine", _engine_label(load) if load else None),
     ]
     parts.append(
         '<section id="run"><h2>Run details</h2><p class="muted">Times include their UTC offset. Setup, measured workload and report generation are recorded separately.</p><dl class="meta">'
@@ -341,6 +342,8 @@ def render_html(report, links=None):
         + pretty(load.get("op_mix", {}))
         + "</div><div><h3>Runner and software versions</h3>"
         + pretty(load.get("environment", {}))
+        + "<h3>Load engine</h3>"
+        + pretty(load.get("engine", {"name": "python"}))
         + "</div></div></details></section>"
     )
     parts.append(
@@ -819,6 +822,13 @@ def render_html(report, links=None):
         + "</script></body></html>"
     )
     return "".join(parts)
+
+
+def _engine_label(load):
+    engine = load.get("engine") or {}
+    if engine.get("name") == "rust":
+        return f"Rust {engine.get('version') or ''}, aws-sdk-s3".replace("  ", " ")
+    return "Python, boto3"
 
 
 def render_markdown(report):

@@ -37,6 +37,12 @@ Latency reference: `src/reference_profile.py` plus `config/reference_profiles/*.
 
 A pause of the test machine is never the storage's fault. `keep_awake()` runs `caffeinate` on macOS, `PauseWatch` records each pause during `load`, and the report leaves paused time and 60 s of recovery out of every rate, latency and visibility check. A worker crash keeps its message in `worker_errors`, with credentials removed by `redact()`. Running out of open files raises `RunnerLimitError`, never a failed request against the storage.
 
+The workload step runs on the Rust load engine in `loadgen/` (`aws-sdk-s3`, the same S3 library as BYOC). One Python process could not send the 1TB workload: in an AWS run it made small reads take 71 ms instead of 30, and the report blamed S3. `src/load_engine.py` builds the engine settings, passes them and the credentials on standard input (never the command line), and records the engine summary in the load stage under `engine`. `--engine auto` uses Rust when `loadgen/target/release/byoc-loadgen` exists, and falls back to Python only for `100GB`; every larger tier refuses to run on Python. The engine writes the same `ingest_merge.jsonl` and `query.jsonl` rows as the Python engine, so the report does not care which one ran. Both engines must follow the same workload rules, listed in `docs/measurement_policy.md` under "The workload": indexers start spread over one commit interval, merges never block uploads, a merge unpublishes its inputs before the garbage collector deletes them after `gc_grace_period_s`, and searches are open loop. Uploads and searches run on separate thread pools in the engine, because hashing a 196 MB upload holds a thread for about 120 ms and once delayed 2% of searches. `machine_limit()` in `src/report_model.py` adds a headline note when the engine fell behind its schedule or kept most cores busy. Build with `cargo build --release --manifest-path loadgen/Cargo.toml`; test with `cargo test --release --manifest-path loadgen/Cargo.toml`. `cargo run --release --example null_s3` starts a server that stores nothing, to measure the engine's own cost. The test machine sizes per tier live in `docs/run_a_validation.md` under "Choose a test machine"; re-measure before changing them.
+
+The tool ships as a container image (`Dockerfile`, linux/amd64 and linux/arm64), run through `bin/byoc-s3`. Users type `byoc-s3 validate ...`, not `python run_validation.py ...`; every documented command uses `byoc-s3`, and `tests/test_docs.py` parses both forms. The wrapper mounts the current folder at the same path, passes connection variables by name only (never values on a command line), mounts an outside `--ca-bundle`, runs as the caller's user, uses `--network host` on Linux and `caffeinate` on macOS. `tests/test_docs.py::test_the_wrapper_passes_every_connection_setting` fails if a new connection variable is not passed. Inside the image, `BYOC_CONTAINER=1`, `BYOC_LOADGEN` points at the engine, `BYOC_REPORTS_DIR` (set by the wrapper) replaces the default `reports/` folder, and `BYOC_SOURCE_COMMIT` replaces git in the run record. `docker/entrypoint.sh` also handles `print-wrapper` (writes the wrapper with the image name filled in) and `sample-report`. The engine stage cross-compiles on `$BUILDPLATFORM`: rustc crashes under QEMU emulation, so never build it emulated.
+
+Bucket addressing must match BYOC's S3 library: `addressing_style()` in `src/qw_s3_client.py` uses virtual-hosted style unless `force_path_style` is set or the endpoint is an IP address. boto3's "auto" style used paths for every custom endpoint, so the compatibility check once passed BYOC defaults on an endpoint where the Rust engine, like BYOC, failed every request.
+
 Do not edit the code while the user has a run going. Commands import `src/` modules lazily, so a long run picks up half-edited files, and its traceback shows the new lines next to the old line numbers.
 
 Every object a run writes must live under `qwcert/<run id>/`. That rule is what makes `src/cleanup.py` safe in a shared bucket: it deletes only that prefix, never the bucket. `run_prefix()` refuses anything that is not a 32-character run id, so the prefix can never widen. Never write test objects anywhere else. `validate` cleans up after the report unless `--keep-objects`.
@@ -61,7 +67,12 @@ The framework has three layers. Run them in sequence, and gate each layer on the
 ## Commands
 
 ```bash
-# Setup
+# Container (what users run)
+docker build -t byoc-s3-validation .
+docker run --rm byoc-s3-validation print-wrapper > ~/.local/bin/byoc-s3 && chmod +x ~/.local/bin/byoc-s3
+byoc-s3 validate --tier 100GB --duration-min 1 --levels 1,8,16 --repeats 1
+
+# Setup from source
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt          # runtime deps (boto3, botocore, PyYAML)
 pip install -r requirements-dev.txt      # + pytest, moto[s3] for the framework's own tests

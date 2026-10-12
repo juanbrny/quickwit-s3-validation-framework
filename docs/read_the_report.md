@@ -23,6 +23,7 @@ The line under the result says whether BYOC can use its default storage settings
 A box under the result lists what the report cannot tell you. For example:
 
 - that the test machine stopped for a while, for example because it went to sleep — the report then leaves that time out, so the storage is not blamed for it;
+- that the test machine was near its limit, because searches started late or most cores were busy — the response times may then describe the machine, not the storage;
 - that only some of the steps ran;
 - that response times were compared with published AWS figures, not with your own AWS run;
 - that the certificate was not checked.

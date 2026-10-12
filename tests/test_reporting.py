@@ -303,7 +303,8 @@ def test_a_crashed_worker_reports_its_cause_without_credentials(
     run = tmp_path / "crash"
     code = main(["load", "--endpoint", moto_server_endpoint, "--bucket", "qw-crash",
                  "--access-key", "testing", "--secret-key", secret,
-                 "--run-dir", str(run), "--tier", "100GB", "--duration-min", "0.05"])
+                 "--run-dir", str(run), "--tier", "100GB", "--duration-min", "0.05",
+                 "--engine", "python"])
     assert code == 1  # a clean failure, not a traceback
     error = capsys.readouterr().err
     assert "Traceback" not in error

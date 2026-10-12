@@ -8,21 +8,29 @@ This is a storage-only test. It does not test search results, data durability or
 
 ## Quick start
 
-```bash
-python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+The tool runs in a container. You need Docker or Podman, and no Python or Rust. Build the image, and install `byoc-s3`, the script that runs it:
 
+```bash
+docker build -t byoc-s3-validation .
+mkdir -p ~/.local/bin
+docker run --rm byoc-s3-validation print-wrapper > ~/.local/bin/byoc-s3
+chmod +x ~/.local/bin/byoc-s3
+```
+
+Then run a short test:
+
+```bash
 export QW_S3_ENDPOINT=https://s3.example.com
 export QW_S3_BUCKET=my-test-bucket
 export QW_S3_ACCESS_KEY=...
 export QW_S3_SECRET_KEY=...
 
-python run_validation.py validate --tier 100GB --duration-min 1 --levels 1,8,16 --repeats 1
+byoc-s3 validate --tier 100GB --duration-min 1 --levels 1,8,16 --repeats 1
 ```
 
-This short run proves the connection works. **It is not a real result.** The command prints where it wrote `report.html`. Open that file in a browser to see what a report looks like.
+This short run proves the connection works. **It is not a real result.** The command prints where it wrote `report.html`, in `reports/` under the current folder. Open that file in a browser to see what a report looks like.
 
-You do not need an AWS account. The tool compares your storage with published AWS S3 figures.
+You do not need an AWS account. The tool compares your storage with published AWS S3 figures. [Run validations](docs/run_a_validation.md) also shows which test machine each daily volume needs.
 
 ## Documents
 

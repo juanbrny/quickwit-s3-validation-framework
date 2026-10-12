@@ -6,6 +6,10 @@ model_constants:
   compression_ratio: 2.75       # raw bytes / indexed bytes [docs: 23TB benchmark]
   commit_timeout_s: 60          # indexer flush interval [docs default]
   merge_factor: 10              # splits consolidated per merge [docs default]
+  gc_grace_period_s: 60         # wait between unpublishing a merged-away split
+                                # and deleting it, so searches that already
+                                # chose it can finish. BYOC waits longer; one
+                                # minute keeps the deletes inside a 30-minute run.
   mature_split_gb: 8            # typical BYOC mature split; documented range is
                                 # 1-10GB. At 8GB an upload is two 5GiB parts.
   per_core_indexing_mbps: 27    # worst-case, adversarial dataset [docs]

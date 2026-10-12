@@ -20,6 +20,8 @@ from typing import Optional
 import boto3
 from botocore.client import Config as BotoConfig
 import errno
+import ipaddress
+from urllib.parse import urlsplit
 
 from botocore.exceptions import BotoCoreError, ClientError
 
@@ -451,7 +453,8 @@ def connection_failure(op: str, t0: float, error: BaseException) -> dict:
             "error": type(error).__name__}
 
 
-def ensure_file_descriptors(required: int) -> int:
+def ensure_file_descriptors(required: int, hint: str = " or lower the top"
+                            " concurrency with --levels") -> int:
     """Raise this process's open-file limit to cover a concurrency sweep.
 
     Each in-flight request needs its own socket, and a socket needs a file
@@ -478,12 +481,33 @@ def ensure_file_descriptors(required: int) -> int:
         soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
     if soft < required:
         raise ValueError(
-            f"This machine allows {soft} open files per process. The sweep needs"
+            f"This machine allows {soft} open files per process. The run needs"
             f" about {required}, one socket per concurrent request. Raise the"
-            f" limit with `ulimit -n {required}` in this shell, or lower the top"
-            " concurrency with --levels."
+            f" limit with `ulimit -n {required}` in this shell,{hint}."
         )
     return soft
+
+
+def addressing_style(cfg: "QwS3Config") -> str:
+    """Address buckets the way BYOC's S3 library does.
+
+    Without `force_path_style`, the AWS SDK for Rust puts the bucket in the
+    host name (`bucket.s3.example.com`), except when the endpoint is an IP
+    address. boto3's "auto" style instead uses paths for every custom
+    endpoint. So the compatibility check passed BYOC's defaults on an
+    endpoint without bucket host names, and the load engine then failed
+    every request with a name lookup error.
+    """
+    if cfg.force_path_style:
+        return "path"
+    host = urlsplit(cfg.endpoint_url).hostname if cfg.endpoint_url else None
+    if host:
+        try:
+            ipaddress.ip_address(host)
+            return "path"
+        except ValueError:
+            pass
+    return "virtual"
 
 
 def boto_config(cfg: "QwS3Config", max_pool_connections: int) -> BotoConfig:
@@ -501,7 +525,7 @@ def boto_config(cfg: "QwS3Config", max_pool_connections: int) -> BotoConfig:
     """
     return BotoConfig(
         signature_version="s3v4",
-        s3={"addressing_style": "path" if cfg.force_path_style else "auto"},
+        s3={"addressing_style": addressing_style(cfg)},
         max_pool_connections=max_pool_connections,
         retries={"max_attempts": 3, "mode": "standard"},
         request_checksum_calculation="when_required",

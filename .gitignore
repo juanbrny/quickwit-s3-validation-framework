@@ -12,3 +12,6 @@ reports/*
 
 .env
 *.env
+
+# Rust build output of the load engine
+loadgen/target/
